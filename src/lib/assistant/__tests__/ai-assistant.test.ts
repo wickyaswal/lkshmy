@@ -12,7 +12,7 @@ afterEach(() => {
 });
 
 describe("assistant AI modules", () => {
-  it("snapshot builder includes deterministic outputs and excludes secrets", async () => {
+  it("snapshot builder includes balance suggestions and excludes secrets", async () => {
     process.env.KRAKEN_API_SECRET = "very-secret-value";
 
     vi.spyOn(providers, "getAssistantMarketState").mockResolvedValue({
@@ -51,6 +51,7 @@ describe("assistant AI modules", () => {
       positions: [],
       openOrders: [],
       quoteBalances: [],
+      portfolio: [{ asset: "USDT", available: 30 }],
       latestActivity: null,
       lastError: "Not connected"
     });
@@ -58,21 +59,68 @@ describe("assistant AI modules", () => {
     const snapshot = await buildAiSnapshot({
       includeRawCandles: false,
       context: {
-        selectedPairs: ["BTCUSDT"],
-        strategyParams: DEFAULT_STRATEGY_PARAMS,
-        tradingCapital: 1000,
-        learningMode: true
+        strategyParams: DEFAULT_STRATEGY_PARAMS
       }
     });
 
-    expect(snapshot.coins.length).toBeGreaterThan(0);
-    expect(snapshot.coins[0]?.deterministic.viability).toBeTypeOf("string");
-    expect(snapshot.coins[0]?.ma.summary.count).toBeGreaterThan(0);
-    expect(snapshot.coins[0]?.ma.rawCloses).toBeUndefined();
+    expect(snapshot.balanceSuggestions.length).toBeGreaterThan(0);
+    expect(snapshot.balanceSuggestions[0]?.headline).toBeTypeOf("string");
+    expect(snapshot.suggestionUniverse.length).toBeGreaterThan(0);
 
     const serialized = JSON.stringify(snapshot);
     expect(serialized).not.toContain("very-secret-value");
     expect(serialized).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("uses EUR watchlist for AI snapshot when EUR is the funded quote asset", async () => {
+    vi.spyOn(providers, "getAssistantPositionsState").mockResolvedValue({
+      ok: true,
+      authenticated: true,
+      checkedAt: "2026-03-05T00:00:00.000Z",
+      positions: [],
+      openOrders: [],
+      quoteBalances: [{ asset: "EUR", available: 95.06 }],
+      portfolio: [{ asset: "EUR", available: 95.06 }],
+      latestActivity: null,
+      lastError: null
+    });
+    vi.spyOn(providers, "getAssistantMarketState").mockImplementation(async (input) => ({
+      ok: true,
+      asOf: "2026-03-05T00:00:00.000Z",
+      pairs: input.pairs.map((pair) => ({
+        pair,
+        wsSymbol: null,
+        ticker: {
+          pair,
+          bid: 100,
+          ask: 100.1,
+          last: 100.05,
+          spreadPct: 0.001,
+          openReferencePrice: 99,
+          openReferenceLabel: "DAY_OPEN",
+          timestamp: "2026-03-05T00:00:00.000Z"
+        },
+        candles: Array.from({ length: 120 }, () => 100),
+        instrument: {
+          pair,
+          minOrderQty: 0.001,
+          qtyStep: 0.000001,
+          priceStep: 0.01,
+          minNotional: 0.5
+        },
+        error: null
+      }))
+    }));
+
+    const snapshot = await buildAiSnapshot({
+      includeRawCandles: false,
+      context: {
+        strategyParams: DEFAULT_STRATEGY_PARAMS
+      }
+    });
+
+    expect(snapshot.suggestionUniverse).toEqual(["BTCEUR", "ETHEUR", "SOLEUR"]);
+    expect(snapshot.account.portfolio[0]?.asset).toBe("EUR");
   });
 
   it("validates AI response schema and rejects invalid shape", () => {
@@ -92,72 +140,55 @@ describe("assistant AI modules", () => {
     expect(invalid.success).toBe(false);
   });
 
-  it("states no viable candidates when none are viable", () => {
+  it("states no BUY candidates when no deterministic BUY exists", () => {
     const snapshot: AiSnapshot = {
       generatedAt: "2026-03-05T00:00:00.000Z",
       settings: {
-        selectedPairs: ["BTCUSDT"],
         strategyParams: DEFAULT_STRATEGY_PARAMS,
-        tradingCapital: 1000,
-        learningMode: true,
-        quoteAsset: "USDT",
-        availableQuoteBalance: 30
+        netEdgeSanity: {
+          maxPossibleNetEdgeNoSpreadPct: 0.0015,
+          maxPossibleNetEdgeNoSpreadBps: 15,
+          minNetEdgePct: 0.0015,
+          minNetEdgeBps: 15,
+          viableUnreachable: true
+        }
       },
-      watchlistUniverse: ["BTCUSDT"],
       sentiment: {
         label: "Risk-off",
         classification: "RISK_OFF",
         scorePct: -0.02,
         scoreBps: -200,
-        referenceLabel: "OPEN_24H"
-      },
-      deterministicTopCandidates: [
-        {
-          pair: "BTCUSDT",
-          viability: "MARGINAL",
-          decision: "WAIT",
-          scoreScaled: 1,
-          spreadBps: 10,
-          deviationBps: 20,
-          netEdgeBps: 5
+        referenceLabel: "OPEN_24H",
+        thresholds: {
+          riskOffPct: -0.01,
+          riskOnPct: 0.01
         }
-      ],
-      coins: [
+      },
+      suggestionUniverse: ["BTCUSDT"],
+      balanceSuggestions: [
         {
-          pair: "BTCUSDT",
-          ticker: null,
-          ma: {
-            period: 50,
-            value: null,
-            deviationPct: 0,
-            summary: {
-              count: 0,
-              minClose: null,
-              maxClose: null,
-              lastClose: null
-            }
-          },
-          instrument: null,
-          deterministic: {
-            decision: "WAIT",
-            viability: "NOT_VIABLE",
-            signalDetected: false,
-            spreadPct: 0,
-            netEdgePct: 0,
-            deviationPct: 0,
-            entryPrice: null,
-            tpPrice: null,
-            slPrice: null,
-            suggestedNotional: 0,
-            suggestedQty: 0,
-            minOrderOk: false,
-            blockingReasons: ["No signal"]
+          asset: "USDT",
+          marketPair: "BTCUSDT",
+          side: "BUY",
+          status: "WATCH",
+          primaryOrderType: "LIMIT",
+          headline: "USDT is best kept on watch for BTC.",
+          summary: "Signal or viability is not fully aligned yet.",
+          quantity: 0.0005,
+          price: 100,
+          triggerPrice: 100,
+          total: 50,
+          notes: ["No signal yet."],
+          metrics: {
+            spreadBps: 10,
+            deviationBps: 20,
+            netEdgeBps: 5
           }
         }
       ],
       account: {
         authenticated: false,
-        quoteBalances: [],
+        portfolio: [],
         latestActivity: null,
         lastError: null
       }
@@ -170,7 +201,7 @@ describe("assistant AI modules", () => {
     });
     const guarded = enforceViableMessaging(fallback, snapshot);
 
-    expect(guarded.answer).toContain("No VIABLE candidates");
+    expect(guarded.answer).toContain("No ready copy-trade suggestions");
     expect(guarded.top_candidates.every((candidate) => candidate.status !== "VIABLE")).toBe(true);
   });
 
@@ -181,26 +212,31 @@ describe("assistant AI modules", () => {
       snapshot: {
         generatedAt: "2026-03-05T00:00:00.000Z",
         settings: {
-          selectedPairs: ["BTCUSDT"],
           strategyParams: DEFAULT_STRATEGY_PARAMS,
-          tradingCapital: 1000,
-          learningMode: true,
-          quoteAsset: "USDT",
-          availableQuoteBalance: 30
+          netEdgeSanity: {
+            maxPossibleNetEdgeNoSpreadPct: 0.0015,
+            maxPossibleNetEdgeNoSpreadBps: 15,
+            minNetEdgePct: 0.0015,
+            minNetEdgeBps: 15,
+            viableUnreachable: true
+          }
         },
-        watchlistUniverse: ["BTCUSDT"],
         sentiment: {
           label: "Neutral",
           classification: "NEUTRAL",
           scorePct: 0,
           scoreBps: 0,
-          referenceLabel: "OPEN_24H"
+          referenceLabel: "OPEN_24H",
+          thresholds: {
+            riskOffPct: -0.01,
+            riskOnPct: 0.01
+          }
         },
-        deterministicTopCandidates: [],
-        coins: [],
+        suggestionUniverse: ["BTCUSDT"],
+        balanceSuggestions: [],
         account: {
           authenticated: false,
-          quoteBalances: [],
+          portfolio: [],
           latestActivity: null,
           lastError: null
         }

@@ -58,22 +58,32 @@ const parseKrakenTimestamp = (value: string | number | undefined): string => {
 };
 
 const resolveOpenReference = (
-  values?: string[]
+  value?: string[] | string
 ): { openReferencePrice: number | null; openReferenceLabel: "OPEN_24H" | "DAY_OPEN" | null } => {
-  const open24h = Number(values?.[1] ?? 0);
-  if (Number.isFinite(open24h) && open24h > 0) {
-    return {
-      openReferencePrice: open24h,
-      openReferenceLabel: "OPEN_24H"
-    };
-  }
+  if (Array.isArray(value)) {
+    const open24h = Number(value[1] ?? 0);
+    if (Number.isFinite(open24h) && open24h > 0) {
+      return {
+        openReferencePrice: open24h,
+        openReferenceLabel: "OPEN_24H"
+      };
+    }
 
-  const dayOpen = Number(values?.[0] ?? 0);
-  if (Number.isFinite(dayOpen) && dayOpen > 0) {
-    return {
-      openReferencePrice: dayOpen,
-      openReferenceLabel: "DAY_OPEN"
-    };
+    const dayOpen = Number(value[0] ?? 0);
+    if (Number.isFinite(dayOpen) && dayOpen > 0) {
+      return {
+        openReferencePrice: dayOpen,
+        openReferenceLabel: "DAY_OPEN"
+      };
+    }
+  } else if (typeof value === "string") {
+    const dayOpen = Number(value);
+    if (Number.isFinite(dayOpen) && dayOpen > 0) {
+      return {
+        openReferencePrice: dayOpen,
+        openReferenceLabel: "DAY_OPEN"
+      };
+    }
   }
 
   return {

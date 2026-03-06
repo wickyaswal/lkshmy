@@ -6,9 +6,9 @@ export const aiAssistantRequestSchema = z.object({
   question: z.string().trim().min(3).max(2000),
   simpleLanguage: z.boolean().default(true),
   includeRawCandles: z.boolean().default(false),
+  includeSnapshot: z.boolean().default(false),
   context: z
     .object({
-      selectedPairs: z.array(z.string().min(3).max(24)).max(10).optional(),
       strategyParams: z
         .object({
           takeProfitPct: z.number(),
@@ -23,10 +23,7 @@ export const aiAssistantRequestSchema = z.object({
           minNetEdgePct: z.number(),
           marginalNetEdgePct: z.number()
         })
-        .optional(),
-      tradingCapital: z.number().nonnegative().optional(),
-      learningMode: z.boolean().optional(),
-      availableQuoteBalance: z.number().nonnegative().optional()
+        .optional()
     })
     .optional()
 });

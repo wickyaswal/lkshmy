@@ -144,7 +144,8 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       asOf: snapshot.generatedAt,
-      response: aiResponse
+      response: aiResponse,
+      snapshot: parsed.data.includeSnapshot ? snapshot : undefined
     });
   } catch (error) {
     const elapsedMs = Date.now() - startedAt;

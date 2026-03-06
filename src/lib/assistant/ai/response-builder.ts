@@ -22,18 +22,24 @@ const buildRisks = (snapshot: AiSnapshot): string[] => {
 
 const buildLearningCorner = (): AiAssistantResponse["learning_corner"] => [
   { term: "Spread", simple: "The gap between bid and ask; wider spread means higher entry/exit cost." },
-  { term: "Net edge", simple: "Expected upside after spread, fees, and slippage are subtracted." },
-  { term: "Deviation vs MA", simple: "How far price is below the moving average, used for entry signal." },
+  { term: "Take profit limit", simple: "A trigger plus a limit price, often used to lock in gains at a chosen level." },
+  { term: "Trailing stop", simple: "A moving stop that follows price and helps protect gains or cap losses." },
+  { term: "Iceberg", simple: "A large order split so only a smaller visible quantity is shown at once." },
   { term: "Notional", simple: "Total order value in quote currency: price × quantity." }
 ];
 
-const viabilityText = (snapshot: AiSnapshot): string => {
-  const viable = snapshot.coins.filter((coin) => coin.deterministic.viability === "VIABLE").length;
-  if (viable === 0) {
-    return "No VIABLE candidates right now under your deterministic rules.";
+const deterministicSummaryText = (snapshot: AiSnapshot): string => {
+  const readyCount = snapshot.balanceSuggestions.filter((item) => item.status === "READY").length;
+  const watchCount = snapshot.balanceSuggestions.filter((item) => item.status === "WATCH").length;
+  if (readyCount > 0) {
+    return `${readyCount} balance-driven suggestion(s) are ready to copy into Kraken. ${watchCount} more are worth monitoring.`;
   }
 
-  return `${viable} VIABLE candidate(s) currently meet your deterministic constraints.`;
+  if (watchCount > 0) {
+    return `No ready copy-trade suggestions right now. ${watchCount} balance-driven idea(s) are worth monitoring.`;
+  }
+
+  return "No ready balance-driven suggestions right now.";
 };
 
 const asNumber = (value: unknown, fallback: number): number => {
@@ -84,38 +90,55 @@ export const buildFallbackAiResponse = (input: {
   simpleLanguage: boolean;
   snapshot: AiSnapshot;
 }): AiAssistantResponse => {
-  const top = input.snapshot.deterministicTopCandidates.slice(0, 3).map((candidate) => {
-    const coin = input.snapshot.coins.find((row) => row.pair === candidate.pair);
-    const note =
-      coin?.deterministic.blockingReasons[0] ??
-      (coin?.deterministic.minOrderOk ? "Meets minimum order checks for current balance." : "Check minimum order constraints.");
+  const ranked = input.snapshot.balanceSuggestions
+    .slice()
+    .sort((left, right) => {
+      const score = (value: AiSnapshot["balanceSuggestions"][number]["status"]): number => {
+        if (value === "READY") {
+          return 2;
+        }
+        if (value === "WATCH") {
+          return 1;
+        }
+        return 0;
+      };
+
+      return score(right.status) - score(left.status);
+    })
+    .slice(0, 3);
+  const top = ranked.map((candidate) => {
+    const status: AiAssistantResponse["top_candidates"][number]["status"] =
+      candidate.status === "READY" ? "VIABLE" : candidate.status === "WATCH" ? "MARGINAL" : "NOT_VIABLE";
+    const note = candidate.notes[0] ?? "Review the Kraken copy form before using this setup.";
+    const modeLabel = candidate.status === "READY" ? "ready to copy" : candidate.status === "WATCH" ? "watch-only" : "blocked";
+    const pair = candidate.marketPair ?? candidate.asset;
 
     return {
-      pair: candidate.pair,
-      status: candidate.viability,
-      why_interesting: `${candidate.pair} shows net edge ${roundTo(candidate.netEdgeBps, 2)} bps and deviation ${roundTo(candidate.deviationBps, 2)} bps with spread ${roundTo(candidate.spreadBps, 2)} bps.`,
+      pair,
+      status,
+      why_interesting: `${pair} is ${modeLabel}: ${candidate.summary}`,
       numbers: {
-        spread_bps: roundTo(candidate.spreadBps, 4),
-        deviation_bps: roundTo(candidate.deviationBps, 4),
-        net_edge_bps: roundTo(candidate.netEdgeBps, 4)
+        spread_bps: roundTo(candidate.metrics.spreadBps ?? 0, 4),
+        deviation_bps: roundTo(candidate.metrics.deviationBps ?? 0, 4),
+        net_edge_bps: roundTo(candidate.metrics.netEdgeBps ?? 0, 4)
       },
       feasibility: {
-        min_order_ok: coin?.deterministic.minOrderOk ?? false,
+        min_order_ok: candidate.quantity > 0 && candidate.total > 0,
         notes: [note]
       },
       if_user_wants_to_simulate: {
-        entry: roundTo(coin?.deterministic.entryPrice ?? 0, 8),
-        tp: roundTo(coin?.deterministic.tpPrice ?? 0, 8),
-        sl: roundTo(coin?.deterministic.slPrice ?? 0, 8),
-        notional: roundTo(coin?.deterministic.suggestedNotional ?? 0, 8),
-        qty: roundTo(coin?.deterministic.suggestedQty ?? 0, 8)
+        entry: roundTo(candidate.price ?? 0, 8),
+        tp: roundTo(candidate.triggerPrice ?? 0, 8),
+        sl: 0,
+        notional: roundTo(candidate.total ?? 0, 8),
+        qty: roundTo(candidate.quantity ?? 0, 8)
       }
     };
   });
 
   const plainAnswer = input.simpleLanguage
-    ? `Short answer: ${viabilityText(input.snapshot)} I can help you compare candidates by spread, net edge, and minimum-size feasibility.`
-    : `Direct answer: ${viabilityText(input.snapshot)} This answer is grounded in your deterministic snapshot and does not override deterministic decisions.`;
+    ? `Short answer: ${deterministicSummaryText(input.snapshot)} I can help you compare the copy-ready Kraken forms, order types, and balance constraints.`
+    : `Direct answer: ${deterministicSummaryText(input.snapshot)} This answer is grounded in your current account snapshot, sentiment, and balance-driven suggestion set.`;
 
   return {
     answer: plainAnswer,
@@ -195,17 +218,17 @@ export const normalizeModelResponse = (raw: unknown, fallback: AiAssistantRespon
 };
 
 export const enforceViableMessaging = (response: AiAssistantResponse, snapshot: AiSnapshot): AiAssistantResponse => {
-  const hasViable = snapshot.coins.some((coin) => coin.deterministic.viability === "VIABLE");
-  if (hasViable) {
+  const hasReadySuggestions = snapshot.balanceSuggestions.some((item) => item.status === "READY");
+  if (hasReadySuggestions) {
     return response;
   }
 
-  if (response.answer.toUpperCase().includes("NO VIABLE")) {
+  if (response.answer.toUpperCase().includes("NO READY")) {
     return response;
   }
 
   return {
     ...response,
-    answer: `No VIABLE candidates right now under your deterministic rules. ${response.answer}`
+    answer: `No ready copy-trade suggestions right now. ${response.answer}`
   };
 };

@@ -262,14 +262,18 @@ export const getAssistantMarketState = async (input: {
 
 export const getAssistantPositionsState = async (input: {
   pairs: string[];
+  forceRefresh?: boolean;
 }): Promise<AssistantPositionsResponse> => {
   const now = formatIsoNow();
   const pairs = parseAssistantPairs(input.pairs, ["BTCUSDT"], 20);
   const cacheKey = pairs.slice().sort().join(",");
   const cacheNow = Date.now();
+  const forceRefresh = input.forceRefresh === true;
   const cachedEntry = positionsCache.get(cacheKey);
 
-  if (cachedEntry && cachedEntry.expiresAt > cacheNow) {
+  if (forceRefresh) {
+    positionsCache.delete(cacheKey);
+  } else if (cachedEntry && cachedEntry.expiresAt > cacheNow) {
     return {
       ...cachedEntry.state,
       cached: {
@@ -330,17 +334,15 @@ export const getAssistantPositionsState = async (input: {
       authenticated: true,
       checkedAt: now,
       positions,
-      openOrders: openOrders
-        .filter((order) => pairs.includes(order.pair))
-        .map((order) => ({
-          orderId: order.orderId,
-          pair: order.pair,
-          side: order.side,
-          type: order.type,
-          qty: order.requestedQty,
-          price: order.avgFillPrice,
-          openedAt: order.createdAt
-        })),
+      openOrders: openOrders.map((order) => ({
+        orderId: order.orderId,
+        pair: order.pair,
+        side: order.side,
+        type: order.type,
+        qty: order.requestedQty,
+        price: order.avgFillPrice,
+        openedAt: order.createdAt
+      })),
       quoteBalances,
       portfolio,
       latestActivity,

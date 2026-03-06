@@ -1,18 +1,27 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Modal from "react-modal";
 import { Tooltip } from "react-tooltip";
 
 import { AutomationTab } from "@/components/automation-tab";
-import { computeMarketSentiment, rankScannerOpportunities } from "@/lib/assistant/dashboard-helpers";
-import { DEFAULT_ASSISTANT_PAIRS, DEFAULT_SELECTED_PAIRS, DEFAULT_STRATEGY_PARAMS } from "@/lib/assistant/defaults";
-import { computeDeterministicSuggestion } from "@/lib/assistant/suggestion-engine";
+import {
+  buildAccountSuggestionPairUniverse,
+  buildBalanceSuggestions,
+  type BalanceSuggestion,
+  type KrakenOrderTemplateType
+} from "@/lib/assistant/account-suggestions";
+import type { AiSnapshot } from "@/lib/assistant/ai/types";
+import {
+  computeMarketSentiment,
+  SENTIMENT_GREEN_THRESHOLD_PCT,
+  SENTIMENT_RED_THRESHOLD_PCT
+} from "@/lib/assistant/dashboard-helpers";
+import { DEFAULT_SELECTED_PAIRS, DEFAULT_STRATEGY_PARAMS } from "@/lib/assistant/defaults";
+import { computeDeterministicSuggestion, evaluateSuggestionParameterSanity } from "@/lib/assistant/suggestion-engine";
 import type {
   AssistantMarketResponse,
-  AssistantPair,
   AssistantPositionsResponse,
-  DeterministicSuggestion,
-  MonitoredPosition,
   StrategyParams
 } from "@/lib/assistant/types";
 import { splitInternalPair, toInternalPair, toKrakenWsPair } from "@/lib/trading/symbol-normalization";
@@ -21,14 +30,6 @@ import { roundTo } from "@/lib/utils";
 
 type TabId = "ASSISTANT" | "AUTOMATION" | "GLOSSARY";
 type AssistantSubTabId = "KRAKEN";
-type AlertType = "TAKE_PROFIT" | "STOP_LOSS" | "TIME_STOP" | "SPREAD_WARNING";
-type AlertItem = {
-  id: string;
-  type: AlertType;
-  pair: string;
-  message: string;
-  at: string;
-};
 type TooltipKey =
   | "takeProfitPct"
   | "stopLossPct"
@@ -41,12 +42,6 @@ type TooltipKey =
   | "assumedSlippagePctRoundtrip"
   | "minNetEdgePct"
   | "marginalNetEdgePct";
-type ExecutedDraft = {
-  marked: boolean;
-  entryPrice: string;
-  qty: string;
-  openedAt: string;
-};
 type GlossaryTermId =
   | "spread"
   | "mid"
@@ -62,7 +57,14 @@ type GlossaryTermId =
   | "timeStop"
   | "notional"
   | "quantity"
-  | "bps";
+  | "bps"
+  | "limitOrder"
+  | "stopLossOrder"
+  | "takeProfitOrder"
+  | "takeProfitLimitOrder"
+  | "icebergOrder"
+  | "trailingStopOrder"
+  | "trailingStopLimitOrder";
 type GlossaryTerm = {
   id: GlossaryTermId;
   title: string;
@@ -126,10 +128,19 @@ type AiAssistantResponsePayload = {
 type AiApiPayload = {
   asOf?: string;
   response?: AiAssistantResponsePayload;
+  snapshot?: AiSnapshot;
   message?: string;
 };
 
-const ALERT_COOLDOWN_MS = 120_000;
+type DiagnosticEntry = {
+  id: string;
+  scope: "Account" | "Suggestions" | "Sentiment" | "Assistant";
+  message: string;
+  at: string;
+};
+
+type AccountSectionKey = "openOrders" | "latestActivity";
+type PanelSectionKey = "balances" | "account" | "suggestions" | "assistant" | "sentiment" | "advancedStrategy";
 const fallbackExampleEntry = 71_429;
 const SENTIMENT_TOOLTIP_ID = "assistant-sentiment-tooltip";
 const GLOSSARY_ORDER: GlossaryTermId[] = [
@@ -147,7 +158,14 @@ const GLOSSARY_ORDER: GlossaryTermId[] = [
   "timeStop",
   "notional",
   "quantity",
-  "bps"
+  "bps",
+  "limitOrder",
+  "stopLossOrder",
+  "takeProfitOrder",
+  "takeProfitLimitOrder",
+  "icebergOrder",
+  "trailingStopOrder",
+  "trailingStopLimitOrder"
 ];
 
 const parseJson = async <T,>(response: Response): Promise<T> => (await response.json()) as T;
@@ -157,11 +175,90 @@ const formatPair = (pair: string): string => {
   return `${base}-${quote}`;
 };
 
+const formatOrderTypeLabel = (value: KrakenOrderTemplateType): string =>
+  value
+    .toLowerCase()
+    .split("_")
+    .map((part) => `${part[0]?.toUpperCase() ?? ""}${part.slice(1)}`)
+    .join(" ");
+
+const numberFormatters = {
+  compact2: new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  }),
+  compact4: new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4
+  }),
+  qty8: new Intl.NumberFormat("en-US", {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 8
+  })
+};
+
 const toBps = (value: number): number => value * 10_000;
 const formatPct = (value: number, decimals = 3): string => `${roundTo(value * 100, decimals)}%`;
 const formatPctPrecise = (value: number): string => `${roundTo(value * 100, 4)}%`;
-const formatBps = (value: number): string => `${roundTo(toBps(value), 2)} bps`;
+const formatBps = (value: number): string => {
+  const bps = toBps(value);
+  if (bps !== 0 && Math.abs(bps) < 0.1) {
+    return `${roundTo(bps, 4)} bps`;
+  }
+
+  return `${roundTo(bps, 2)} bps`;
+};
 const formatMoney = (value: number): string => `${roundTo(value, 6)}`;
+const formatDisplayPrice = (value: number | null): string => {
+  if (value === null || !Number.isFinite(value)) {
+    return "n/a";
+  }
+
+  if (Math.abs(value) >= 1000) {
+    return numberFormatters.compact2.format(value);
+  }
+
+  return numberFormatters.compact4.format(value);
+};
+const formatDisplayAvailable = (value: number): string => {
+  const abs = Math.abs(value);
+
+  if (!Number.isFinite(value)) {
+    return "n/a";
+  }
+
+  if (abs >= 1000) {
+    return numberFormatters.compact2.format(value);
+  }
+
+  if (abs >= 1) {
+    return numberFormatters.compact2.format(value);
+  }
+
+  if (abs >= 0.01) {
+    return numberFormatters.compact4.format(value);
+  }
+
+  return numberFormatters.qty8.format(value);
+};
+const formatDisplayQty = (value: number): string => numberFormatters.qty8.format(value);
+const formatShortDateTime = (value: string): string => {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) {
+    return value;
+  }
+
+  return new Date(time).toLocaleString();
+};
+const formatPanelStatusLabel = (open: boolean): string => (open ? "Collapse" : "Expand");
+const buildKrakenMarketUrl = (pair: string | null): string | null => {
+  if (!pair) {
+    return null;
+  }
+
+  const { base, quote } = splitInternalPair(pair);
+  return `https://pro.kraken.com/app/trade/${base.toLowerCase()}-${quote.toLowerCase()}`;
+};
 
 const normalizeDecimalInput = (value: string): string => value.trim().replace(",", ".");
 
@@ -170,53 +267,39 @@ const parseDecimalInput = (value: string): number => {
   return Number.isFinite(parsed) ? parsed : 0;
 };
 
-const nowDateTimeLocal = (): string => {
-  const date = new Date();
-  const tzOffsetMs = date.getTimezoneOffset() * 60_000;
-  return new Date(date.getTime() - tzOffsetMs).toISOString().slice(0, 16);
-};
-
 const resolveOpenReference = (
-  values?: string[]
+  value?: string[] | string
 ): { openReferencePrice: number | null; openReferenceLabel: "OPEN_24H" | "DAY_OPEN" | null } => {
-  const open24h = Number(values?.[1] ?? 0);
-  if (Number.isFinite(open24h) && open24h > 0) {
-    return {
-      openReferencePrice: open24h,
-      openReferenceLabel: "OPEN_24H"
-    };
-  }
+  if (Array.isArray(value)) {
+    const open24h = Number(value[1] ?? 0);
+    if (Number.isFinite(open24h) && open24h > 0) {
+      return {
+        openReferencePrice: open24h,
+        openReferenceLabel: "OPEN_24H"
+      };
+    }
 
-  const dayOpen = Number(values?.[0] ?? 0);
-  if (Number.isFinite(dayOpen) && dayOpen > 0) {
-    return {
-      openReferencePrice: dayOpen,
-      openReferenceLabel: "DAY_OPEN"
-    };
+    const dayOpen = Number(value[0] ?? 0);
+    if (Number.isFinite(dayOpen) && dayOpen > 0) {
+      return {
+        openReferencePrice: dayOpen,
+        openReferenceLabel: "DAY_OPEN"
+      };
+    }
+  } else if (typeof value === "string") {
+    const dayOpen = Number(value);
+    if (Number.isFinite(dayOpen) && dayOpen > 0) {
+      return {
+        openReferencePrice: dayOpen,
+        openReferenceLabel: "DAY_OPEN"
+      };
+    }
   }
 
   return {
     openReferencePrice: null,
     openReferenceLabel: null
   };
-};
-
-const getSimpleReason = (suggestion: DeterministicSuggestion): string => {
-  return suggestion.whyBullets[0] ?? suggestion.reasons[0] ?? "No clear setup yet.";
-};
-
-const getNextStep = (suggestion: DeterministicSuggestion): string => {
-  if (suggestion.decision === "BUY") {
-    return suggestion.entryPrice
-      ? `Consider a limit buy near ${roundTo(suggestion.entryPrice, 6)} and pre-plan TP/SL.`
-      : "Consider a limit entry only after validating spread and costs.";
-  }
-
-  if (suggestion.decision === "DO_NOT_TRADE") {
-    return "Skip this setup for now and wait for cleaner conditions.";
-  }
-
-  return "Wait and monitor until deviation, spread, and net edge align.";
 };
 
 const glossaryTermContent = (id: GlossaryTermId, context: GlossaryContext): Omit<GlossaryTerm, "id"> => {
@@ -332,6 +415,55 @@ const glossaryTermContent = (id: GlossaryTermId, context: GlossaryContext): Omit
         definition: "BPS means basis points: 1 bps = 0.01%.",
         why: "BPS makes small cost/edge values easier to compare.",
         example: `Example: sentiment is ${context.sentimentLabel} at ${formatPctPrecise(context.sentimentScorePct)}.`
+      };
+    case "limitOrder":
+      return {
+        title: "Limit Order",
+        definition: "A limit order only fills at your chosen price or better.",
+        why: "It gives you price control, which is why the app uses it as the default copy form.",
+        example: `Example: set a buy or sell at a fixed price such as ${roundTo(entry, 2)}.`
+      };
+    case "stopLossOrder":
+      return {
+        title: "Stop Loss Order",
+        definition: "A stop loss triggers when price moves against you to a chosen level.",
+        why: "It is the simplest way to cap downside when a trade goes wrong.",
+        example: `Example: if entry is ${roundTo(entry, 2)}, a ${formatPct(context.params.stopLossPct)} stop sits near ${roundTo(sl, 2)}.`
+      };
+    case "takeProfitOrder":
+      return {
+        title: "Take Profit Order",
+        definition: "A take profit triggers when price reaches your profit target.",
+        why: "It helps lock in gains automatically once the market reaches your planned exit level.",
+        example: `Example: if entry is ${roundTo(entry, 2)}, a ${formatPct(context.params.takeProfitPct)} target sits near ${roundTo(tp, 2)}.`
+      };
+    case "takeProfitLimitOrder":
+      return {
+        title: "Take Profit Limit",
+        definition: "A take profit limit uses a trigger price plus a separate limit price.",
+        why: "It gives more execution control than a plain take profit order.",
+        example: "Example: trigger at the profit level, then cap the actual fill with a nearby limit price."
+      };
+    case "icebergOrder":
+      return {
+        title: "Iceberg Order",
+        definition: "An iceberg order hides most of the order and only shows a small visible piece.",
+        why: "It can reduce market signaling when the order size is large.",
+        example: "Example: sell 10 units but show only 2 units at a time."
+      };
+    case "trailingStopOrder":
+      return {
+        title: "Trailing Stop",
+        definition: "A trailing stop moves with the market by a fixed offset instead of using one fixed stop price.",
+        why: "It can protect gains while still allowing price to keep trending in your favor.",
+        example: "Example: keep the stop 1% below price as it rises."
+      };
+    case "trailingStopLimitOrder":
+      return {
+        title: "Trailing Stop Limit",
+        definition: "A trailing stop limit adds a limit price to the trailing stop trigger.",
+        why: "It gives more fill control, but there is a higher chance of not filling in fast markets.",
+        example: "Example: trail the stop, then submit a limit order when the stop is triggered."
       };
     default:
       return {
@@ -535,25 +667,14 @@ function ParameterField(input: ParameterFieldProps) {
 export function TradingAssistantShell() {
   const [activeTab, setActiveTab] = useState<TabId>("ASSISTANT");
   const [assistantSubTab, setAssistantSubTab] = useState<AssistantSubTabId>("KRAKEN");
-  const [learningMode, setLearningMode] = useState(true);
   const [activeGlossaryTerm, setActiveGlossaryTerm] = useState<GlossaryTermId | null>(null);
-  const [tradingCapitalInput, setTradingCapitalInput] = useState<string>("1000");
   const [selectedPairs, setSelectedPairs] = useState<string[]>(DEFAULT_SELECTED_PAIRS);
-  const [scannerWatchlist, setScannerWatchlist] = useState<string[]>(DEFAULT_ASSISTANT_PAIRS);
-  const [scannerBalanceOverride, setScannerBalanceOverride] = useState<string>("");
   const [params, setParams] = useState<StrategyParams>(DEFAULT_STRATEGY_PARAMS);
   const [marketState, setMarketState] = useState<AssistantMarketResponse | null>(null);
   const [positionsState, setPositionsState] = useState<AssistantPositionsResponse | null>(null);
+  const [accountSuggestionMarketState, setAccountSuggestionMarketState] = useState<AssistantMarketResponse | null>(null);
   const [liveTickers, setLiveTickers] = useState<Record<string, TickerSnapshot>>({});
-  const [feedback, setFeedback] = useState("Assistant is running in deterministic mode.");
-  const [manualOverride, setManualOverride] = useState(false);
-  const [manualPair, setManualPair] = useState<string>(DEFAULT_SELECTED_PAIRS[0]);
-  const [manualEntryPrice, setManualEntryPrice] = useState<string>("");
-  const [manualQty, setManualQty] = useState<string>("");
-  const [manualOpenedAt, setManualOpenedAt] = useState<string>("");
-  const [executedDrafts, setExecutedDrafts] = useState<Record<string, ExecutedDraft>>({});
-  const [alerts, setAlerts] = useState<AlertItem[]>([]);
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>("default");
+  const [feedback, setFeedback] = useState("Balance-driven suggestions are active.");
   const [aiQuestion, setAiQuestion] = useState("");
   const [aiSimpleLanguage, setAiSimpleLanguage] = useState(true);
   const [aiIncludeRawCandles, setAiIncludeRawCandles] = useState(false);
@@ -561,12 +682,75 @@ export function TradingAssistantShell() {
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiAsOf, setAiAsOf] = useState<string | null>(null);
   const [aiResponse, setAiResponse] = useState<AiAssistantResponsePayload | null>(null);
+  const [aiSnapshotPayload, setAiSnapshotPayload] = useState<AiSnapshot | null>(null);
+  const [showAiSnapshot, setShowAiSnapshot] = useState(false);
   const [aiCooldownUntilMs, setAiCooldownUntilMs] = useState(0);
-  const alertStateRef = useRef(new Map<string, { active: boolean; lastTriggeredAt: number }>());
+  const [advancedStrategyOpen, setAdvancedStrategyOpen] = useState(false);
+  const [panelOpen, setPanelOpen] = useState<Record<PanelSectionKey, boolean>>({
+    balances: true,
+    account: true,
+    suggestions: true,
+    assistant: true,
+    sentiment: true,
+    advancedStrategy: false
+  });
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticEntry[]>([]);
+  const [marketFetchError, setMarketFetchError] = useState<string | null>(null);
+  const [positionsFetchError, setPositionsFetchError] = useState<string | null>(null);
+  const [accountSuggestionFetchError, setAccountSuggestionFetchError] = useState<string | null>(null);
+  const [refreshingAccountSnapshot, setRefreshingAccountSnapshot] = useState(false);
+  const [accountSectionsOpen, setAccountSectionsOpen] = useState<Record<AccountSectionKey, boolean>>({
+    openOrders: true,
+    latestActivity: true
+  });
+  const [activeSuggestionKey, setActiveSuggestionKey] = useState<string | null>(null);
+  const [activeSuggestionOrderType, setActiveSuggestionOrderType] = useState<KrakenOrderTemplateType | null>(null);
+  const [copiedSuggestionFieldKey, setCopiedSuggestionFieldKey] = useState<string | null>(null);
+  const diagnosticsLastSeenRef = useRef(new Map<string, number>());
   const glossaryRefs = useRef<Partial<Record<GlossaryTermId, HTMLElement | null>>>({});
   const wsSymbolsRef = useRef<Record<string, string>>({});
+  const assistantPanelRef = useRef<HTMLElement | null>(null);
+  const aiTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const tradingCapital = parseDecimalInput(tradingCapitalInput);
+  const pushDiagnostic = useCallback((scope: DiagnosticEntry["scope"], message: string) => {
+    const trimmed = message.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const key = `${scope}:${trimmed}`;
+    const now = Date.now();
+    const lastSeen = diagnosticsLastSeenRef.current.get(key) ?? 0;
+    if (now - lastSeen < 60_000) {
+      return;
+    }
+
+    diagnosticsLastSeenRef.current.set(key, now);
+    setDiagnostics((current) => [
+      {
+        id: `${key}:${now}`,
+        scope,
+        message: trimmed,
+        at: new Date(now).toISOString()
+      },
+      ...current
+    ].slice(0, 100));
+  }, []);
+
+  const redirectToLogin = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const nextPath = `${window.location.pathname}${window.location.search}`;
+    const query = new URLSearchParams({
+      next: nextPath
+    });
+    window.location.assign(`/login?${query.toString()}`);
+  }, []);
+
+  const tradingCapital = 1000;
   const selectedPairsKey = selectedPairs.join(",");
 
   const getMarketPair = (pair: string): AssistantMarketResponse["pairs"][number] | undefined =>
@@ -579,20 +763,21 @@ export function TradingAssistantShell() {
     null;
 
   useEffect(() => {
-    setManualPair((current) => (selectedPairs.includes(current) ? current : selectedPairs[0] ?? "BTCUSDT"));
-  }, [selectedPairs]);
-
-  useEffect(() => {
-    setManualOpenedAt((current) => (current ? current : nowDateTimeLocal()));
+    const stored = window.localStorage.getItem("assistant:advanced-strategy-open");
+    const open = stored === "true";
+    setAdvancedStrategyOpen(open);
+    setPanelOpen((current) => ({
+      ...current,
+      advancedStrategy: open
+    }));
   }, []);
 
   useEffect(() => {
-    if (typeof Notification === "undefined") {
-      setNotificationPermission("denied");
-      return;
-    }
+    window.localStorage.setItem("assistant:advanced-strategy-open", advancedStrategyOpen ? "true" : "false");
+  }, [advancedStrategyOpen]);
 
-    setNotificationPermission(Notification.permission);
+  useEffect(() => {
+    Modal.setAppElement("body");
   }, []);
 
   useEffect(() => {
@@ -727,6 +912,12 @@ export function TradingAssistantShell() {
         const response = await fetch(`/api/assistant/market?${query.toString()}`, {
           cache: "no-store"
         });
+
+        if (response.status === 401) {
+          redirectToLogin();
+          return;
+        }
+
         const payload = await parseJson<MarketApiPayload>(response);
 
         if (!response.ok || !payload.state) {
@@ -735,10 +926,13 @@ export function TradingAssistantShell() {
 
         if (active) {
           setMarketState(payload.state);
+          setMarketFetchError(null);
         }
       } catch (error) {
         if (active) {
-          setFeedback(error instanceof Error ? error.message : "Market feed unavailable.");
+          const message = error instanceof Error ? error.message : "Market feed unavailable.";
+          setMarketFetchError(message);
+          pushDiagnostic("Sentiment", message);
         }
       }
     };
@@ -752,45 +946,134 @@ export function TradingAssistantShell() {
       active = false;
       clearInterval(interval);
     };
-  }, [selectedPairs, selectedPairsKey, params.timeframe, params.maPeriod]);
+  }, [selectedPairs, selectedPairsKey, params.timeframe, params.maPeriod, pushDiagnostic, redirectToLogin]);
 
-  useEffect(() => {
-    let active = true;
-
-    const fetchPositions = async () => {
+  const fetchPositionsState = useCallback(
+    async (forceRefresh = false): Promise<boolean> => {
       try {
         const query = new URLSearchParams({
-          pairs: selectedPairs.join(",")
+          pairs: selectedPairsKey
         });
+        if (forceRefresh) {
+          query.set("force_refresh", "true");
+        }
+
         const response = await fetch(`/api/assistant/positions?${query.toString()}`, {
           cache: "no-store"
         });
+
+        if (response.status === 401) {
+          redirectToLogin();
+          return false;
+        }
+
         const payload = await parseJson<PositionsApiPayload>(response);
 
         if (!payload.state) {
           throw new Error(payload.message ?? "Unable to fetch position state.");
         }
 
-        if (active) {
-          setPositionsState(payload.state);
-        }
+        setPositionsState(payload.state);
+        setPositionsFetchError(null);
+        return true;
       } catch (error) {
-        if (active) {
-          setFeedback(error instanceof Error ? error.message : "Position monitor unavailable.");
-        }
+        const message = error instanceof Error ? error.message : "Position monitor unavailable.";
+        setPositionsFetchError(message);
+        pushDiagnostic("Account", message);
+        return false;
       }
+    },
+    [selectedPairsKey, pushDiagnostic, redirectToLogin]
+  );
+
+  useEffect(() => {
+    let active = true;
+
+    const syncPositions = async (forceRefresh = false) => {
+      if (!active) {
+        return;
+      }
+      await fetchPositionsState(forceRefresh);
     };
 
-    void fetchPositions();
+    void syncPositions();
     const interval = setInterval(() => {
-      void fetchPositions();
+      void syncPositions();
     }, 60_000);
 
     return () => {
       active = false;
       clearInterval(interval);
     };
-  }, [selectedPairs, selectedPairsKey]);
+  }, [fetchPositionsState]);
+
+  const accountSuggestionPairs = useMemo(
+    () =>
+      buildAccountSuggestionPairUniverse({
+        portfolio: positionsState?.portfolio ?? [],
+        latestActivity: positionsState?.latestActivity ?? null,
+        openOrders: positionsState?.openOrders ?? [],
+        selectedPairs
+      }),
+    [positionsState, selectedPairs]
+  );
+
+  useEffect(() => {
+    let active = true;
+
+    const fetchSuggestionMarkets = async () => {
+      if (accountSuggestionPairs.length === 0) {
+        if (active) {
+          setAccountSuggestionMarketState(null);
+          setAccountSuggestionFetchError(null);
+        }
+        return;
+      }
+
+      try {
+        const query = new URLSearchParams({
+          pairs: accountSuggestionPairs.join(","),
+          timeframe: params.timeframe,
+          limit: String(Math.max(120, params.maPeriod + 20))
+        });
+        const response = await fetch(`/api/assistant/market?${query.toString()}`, {
+          cache: "no-store"
+        });
+
+        if (response.status === 401) {
+          redirectToLogin();
+          return;
+        }
+
+        const payload = await parseJson<MarketApiPayload>(response);
+
+        if (!response.ok || !payload.state) {
+          throw new Error(payload.message ?? "Unable to fetch suggestion market snapshot.");
+        }
+
+        if (active) {
+          setAccountSuggestionMarketState(payload.state);
+          setAccountSuggestionFetchError(null);
+        }
+      } catch (error) {
+        if (active) {
+          const message = error instanceof Error ? error.message : "Suggestion market feed unavailable.";
+          setAccountSuggestionFetchError(message);
+          pushDiagnostic("Suggestions", message);
+        }
+      }
+    };
+
+    void fetchSuggestionMarkets();
+    const interval = setInterval(() => {
+      void fetchSuggestionMarkets();
+    }, 20_000);
+
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [accountSuggestionPairs, params.timeframe, params.maPeriod, pushDiagnostic, redirectToLogin]);
 
   const suggestions = selectedPairs.map((pair) => {
     const market = getMarketPair(pair);
@@ -806,31 +1089,9 @@ export function TradingAssistantShell() {
     });
   });
 
-  const quoteAsset = splitInternalPair(firstSelectedPair).quote;
-  const detectedQuoteBalance =
-    positionsState?.quoteBalances.find((balance) => balance.asset.toUpperCase() === quoteAsset.toUpperCase())?.available ?? null;
-  const portfolioRows = positionsState?.portfolio ?? [];
-  const scannerBalance = scannerBalanceOverride.trim()
-    ? parseDecimalInput(scannerBalanceOverride)
-    : detectedQuoteBalance && detectedQuoteBalance > 0
-      ? detectedQuoteBalance
-      : 30;
+  const portfolioRows = useMemo(() => positionsState?.portfolio ?? [], [positionsState?.portfolio]);
   const aiCooldownRemainingSec = Math.max(0, Math.ceil((aiCooldownUntilMs - Date.now()) / 1000));
   const aiSendDisabled = aiLoading || !aiQuestion.trim() || aiCooldownRemainingSec > 0;
-
-  const scannerSuggestions = scannerWatchlist.map((pair) => {
-    const market = getMarketPair(pair);
-    const ticker = liveTickers[pair] ?? market?.ticker ?? null;
-
-    return computeDeterministicSuggestion({
-      pair,
-      tradingCapital: scannerBalance,
-      params,
-      ticker,
-      candles: market?.candles ?? [],
-      instrument: market?.instrument ?? null
-    });
-  });
 
   const sentiment = useMemo(() => {
     return computeMarketSentiment(
@@ -848,15 +1109,31 @@ export function TradingAssistantShell() {
     );
   }, [selectedPairs, liveTickers, marketState]);
 
-  const scannerTop = useMemo(
+  const netEdgeSanity = useMemo(() => evaluateSuggestionParameterSanity(params), [params]);
+  const accountHasIssue = Boolean(
+    positionsFetchError || (positionsState?.ok === false && positionsState.lastError)
+  );
+  const suggestionsHasIssue = Boolean(
+    accountSuggestionFetchError || (accountSuggestionMarketState?.pairs ?? []).some((row) => Boolean(row.error))
+  );
+  const sentimentHasIssue = Boolean(
+    marketFetchError || (marketState?.pairs ?? []).some((row) => Boolean(row.error))
+  );
+  const assistantHasIssue = Boolean(aiError);
+  const balanceSuggestions = useMemo(
     () =>
-      rankScannerOpportunities({
-        suggestions: scannerSuggestions,
-        availableQuoteBalance: scannerBalance,
-        sentiment: sentiment.classification,
-        limit: 3
+      buildBalanceSuggestions({
+        positionsState,
+        marketPairs: accountSuggestionMarketState?.pairs ?? [],
+        params,
+        selectedPairs,
+        sentiment: sentiment.classification
       }),
-    [scannerSuggestions, scannerBalance, sentiment.classification]
+    [positionsState, accountSuggestionMarketState, params, selectedPairs, sentiment.classification]
+  );
+  const activeBalanceSuggestion = useMemo(
+    () => balanceSuggestions.find((row) => row.key === activeSuggestionKey) ?? null,
+    [balanceSuggestions, activeSuggestionKey]
   );
 
   const primarySuggestion = suggestions[0] ?? null;
@@ -865,7 +1142,7 @@ export function TradingAssistantShell() {
     sampleSpreadPct: primarySuggestion?.cost.spreadPct ?? null,
     sampleNetEdgePct: primarySuggestion?.cost.netEdgePct ?? params.takeProfitPct - params.assumedFeePctRoundtrip,
     sampleDeviationPct: primarySuggestion?.deviationPct ?? params.entryThresholdPct,
-    sampleNotional: primarySuggestion?.suggestedNotional ?? scannerBalance,
+    sampleNotional: primarySuggestion?.suggestedNotional ?? tradingCapital,
     sampleQty: primarySuggestion?.suggestedQty ?? 0,
     params,
     sentimentLabel: sentiment.label,
@@ -876,170 +1153,54 @@ export function TradingAssistantShell() {
     ...glossaryTermContent(id, glossaryContext)
   }));
 
-  const manualQtyNumber = parseDecimalInput(manualQty);
-  const manualEntryPriceNumber = parseDecimalInput(manualEntryPrice);
-  const parsedManualOpenedAt = manualOpenedAt ? Date.parse(manualOpenedAt) : Number.NaN;
-  const manualOpenedAtIso = Number.isFinite(parsedManualOpenedAt)
-    ? new Date(parsedManualOpenedAt).toISOString()
-    : new Date().toISOString();
-  const manualPosition: MonitoredPosition | null =
-    !manualPair || manualQtyNumber <= 0 || manualEntryPriceNumber <= 0
-      ? null
-      : {
-          pair: manualPair,
-          qty: manualQtyNumber,
-          entryPrice: manualEntryPriceNumber,
-          openedAt: manualOpenedAtIso,
-          source: "MANUAL"
-        };
-
-  const autoPositions = positionsState?.positions.filter((position) => selectedPairs.includes(position.pair)) ?? [];
-  const basePositions = manualOverride
-    ? manualPosition
-      ? [manualPosition]
-      : []
-    : autoPositions.length > 0
-      ? autoPositions
-      : manualPosition
-        ? [manualPosition]
-        : [];
-
-  const executedPositions: MonitoredPosition[] = [];
-  for (const pair of selectedPairs) {
-    const draft = executedDrafts[pair];
-    if (!draft?.marked) {
-      continue;
-    }
-
-    const entryPrice = parseDecimalInput(draft.entryPrice);
-    const qty = parseDecimalInput(draft.qty);
-    const openedAtMs = Date.parse(draft.openedAt);
-    if (entryPrice <= 0 || qty <= 0 || !Number.isFinite(openedAtMs)) {
-      continue;
-    }
-
-    executedPositions.push({
-      pair,
-      qty,
-      entryPrice,
-      openedAt: new Date(openedAtMs).toISOString(),
-      source: "MARKED_EXECUTED"
-    });
-  }
-
-  const monitoredMap = new Map<string, MonitoredPosition>();
-  for (const position of basePositions) {
-    monitoredMap.set(position.pair, position);
-  }
-  for (const position of executedPositions) {
-    if (!monitoredMap.has(position.pair)) {
-      monitoredMap.set(position.pair, position);
-    }
-  }
-  const monitoredPositions = Array.from(monitoredMap.values());
-  const positionByPair = new Map<string, MonitoredPosition>();
-  for (const position of monitoredPositions) {
-    positionByPair.set(position.pair, position);
-  }
-
   useEffect(() => {
-    const now = Date.now();
-    const nextAlerts: AlertItem[] = [];
-
-    const maybeTrigger = (pair: string, type: AlertType, condition: boolean, message: string) => {
-      const key = `${pair}:${type}`;
-      const previous = alertStateRef.current.get(key) ?? {
-        active: false,
-        lastTriggeredAt: 0
-      };
-
-      if (!condition) {
-        if (previous.active) {
-          alertStateRef.current.set(key, {
-            ...previous,
-            active: false
-          });
-        }
-        return;
-      }
-
-      const canTrigger = !previous.active || now - previous.lastTriggeredAt >= ALERT_COOLDOWN_MS;
-      alertStateRef.current.set(key, {
-        active: true,
-        lastTriggeredAt: canTrigger ? now : previous.lastTriggeredAt
-      });
-
-      if (!canTrigger) {
-        return;
-      }
-
-      const alertItem: AlertItem = {
-        id: `${key}:${now}`,
-        type,
-        pair,
-        message,
-        at: new Date().toISOString()
-      };
-      nextAlerts.push(alertItem);
-
-      if (notificationPermission === "granted" && typeof Notification !== "undefined") {
-        new Notification(`Fiat Buffer Assistant: ${type}`, {
-          body: `${formatPair(pair)}: ${message}`
-        });
-      }
-    };
-
-    for (const position of monitoredPositions) {
-      const market = marketState?.pairs.find((row) => row.pair === position.pair);
-      const ticker = liveTickers[position.pair] ?? market?.ticker ?? null;
-
-      if (!ticker || position.entryPrice <= 0) {
+    for (const row of marketState?.pairs ?? []) {
+      if (!row.error) {
         continue;
       }
 
-      const tpPrice = position.entryPrice * (1 + params.takeProfitPct);
-      const slPrice = position.entryPrice * (1 - params.stopLossPct);
-      const timeStopHit = now - Date.parse(position.openedAt) >= params.maxHoldMinutes * 60_000;
+      pushDiagnostic("Sentiment", `${formatPair(row.pair)}: ${row.error}`);
+    }
+  }, [marketState, pushDiagnostic]);
 
-      maybeTrigger(
-        position.pair,
-        "TAKE_PROFIT",
-        ticker.last >= tpPrice,
-        `Take-profit condition met at ${roundTo(ticker.last, 6)} (target ${roundTo(tpPrice, 6)}).`
-      );
-      maybeTrigger(
-        position.pair,
-        "STOP_LOSS",
-        ticker.last <= slPrice,
-        `Stop-loss condition met at ${roundTo(ticker.last, 6)} (trigger ${roundTo(slPrice, 6)}).`
-      );
-      maybeTrigger(
-        position.pair,
-        "TIME_STOP",
-        timeStopHit,
-        `Time stop reached (${params.maxHoldMinutes} minutes).`
-      );
-      maybeTrigger(
-        position.pair,
-        "SPREAD_WARNING",
-        ticker.spreadPct > params.maxSpreadAllowedPct * 2,
-        `Spread warning: ${formatPct(ticker.spreadPct, 4)} is abnormally high.`
-      );
+  useEffect(() => {
+    for (const row of accountSuggestionMarketState?.pairs ?? []) {
+      if (!row.error) {
+        continue;
+      }
+
+      pushDiagnostic("Suggestions", `${formatPair(row.pair)}: ${row.error}`);
+    }
+  }, [accountSuggestionMarketState, pushDiagnostic]);
+
+  useEffect(() => {
+    if (positionsState?.ok === false && positionsState.lastError) {
+      pushDiagnostic("Account", positionsState.lastError);
+    }
+  }, [positionsState, pushDiagnostic]);
+
+  useEffect(() => {
+    if (!activeSuggestionKey) {
+      return;
     }
 
-    if (nextAlerts.length > 0) {
-      setAlerts((current) => [...nextAlerts, ...current].slice(0, 30));
+    if (!activeBalanceSuggestion) {
+      setActiveSuggestionKey(null);
+      setActiveSuggestionOrderType(null);
+      return;
     }
-  }, [
-    monitoredPositions,
-    liveTickers,
-    marketState,
-    params.takeProfitPct,
-    params.stopLossPct,
-    params.maxHoldMinutes,
-    params.maxSpreadAllowedPct,
-    notificationPermission
-  ]);
+
+    if (activeSuggestionOrderType) {
+      const exists = activeBalanceSuggestion.templates.some((template) => template.type === activeSuggestionOrderType);
+      if (exists) {
+        return;
+      }
+    }
+
+    setActiveSuggestionOrderType(
+      activeBalanceSuggestion.primaryOrderType ?? activeBalanceSuggestion.templates[0]?.type ?? null
+    );
+  }, [activeSuggestionKey, activeSuggestionOrderType, activeBalanceSuggestion]);
 
   useEffect(() => {
     if (activeTab !== "GLOSSARY" || !activeGlossaryTerm) {
@@ -1064,52 +1225,6 @@ export function TradingAssistantShell() {
     setActiveGlossaryTerm(term);
   };
 
-  const togglePair = (pair: AssistantPair) => {
-    setSelectedPairs((current) => {
-      if (current.includes(pair)) {
-        if (current.length === 1) {
-          return current;
-        }
-
-        return current.filter((item) => item !== pair);
-      }
-
-      if (current.length >= 3) {
-        return current;
-      }
-
-      return [...current, pair];
-    });
-  };
-
-  const toggleScannerPair = (pair: AssistantPair) => {
-    setScannerWatchlist((current) => {
-      if (current.includes(pair)) {
-        if (current.length === 1) {
-          return current;
-        }
-
-        return current.filter((item) => item !== pair);
-      }
-
-      if (current.length >= 10) {
-        return current;
-      }
-
-      return [...current, pair];
-    });
-  };
-
-  const requestNotifications = async () => {
-    if (typeof Notification === "undefined") {
-      setFeedback("Browser notifications are not supported in this environment.");
-      return;
-    }
-
-    const permission = await Notification.requestPermission();
-    setNotificationPermission(permission);
-  };
-
   const updateParam = <K extends keyof StrategyParams>(key: K, value: StrategyParams[K]) => {
     setParams((current) => ({
       ...current,
@@ -1124,34 +1239,112 @@ export function TradingAssistantShell() {
 
   const pctHint = (value: number): string => `${formatPct(value, 3)} • ${formatBps(value)}`;
 
-  const updateExecuted = (pair: string, update: Partial<ExecutedDraft>) => {
-    setExecutedDrafts((current) => ({
-      ...current,
-      [pair]: Object.assign(
-        {
-          marked: false,
-          entryPrice: "",
-          qty: "",
-          openedAt: nowDateTimeLocal()
-        },
-        current[pair] ?? {},
-        update
-      )
-    }));
+  const refreshAccountSnapshot = async () => {
+    if (refreshingAccountSnapshot) {
+      return;
+    }
+
+    setRefreshingAccountSnapshot(true);
+    const ok = await fetchPositionsState(true);
+    if (ok) {
+      setFeedback("Account refreshed from Kraken (cache bypassed).");
+    } else {
+      setFeedback("Account refresh failed. See Diagnostics.");
+    }
+    setRefreshingAccountSnapshot(false);
   };
 
-  const markExecuted = (pair: string, suggestionEntry: number | null, suggestionQty: number) => {
-    updateExecuted(pair, {
-      marked: true,
-      entryPrice: suggestionEntry ? String(roundTo(suggestionEntry, 8)) : "",
-      qty: suggestionQty > 0 ? String(roundTo(suggestionQty, 8)) : "",
-      openedAt: nowDateTimeLocal()
+  const togglePanel = (key: PanelSectionKey) => {
+    setPanelOpen((current) => {
+      const next = !current[key];
+      if (key === "advancedStrategy") {
+        setAdvancedStrategyOpen(next);
+      }
+
+      return {
+        ...current,
+        [key]: next
+      };
     });
   };
 
-  const applyScannerPair = (pair: string) => {
-    setSelectedPairs([pair]);
-    setFeedback(`Scanner pair ${formatPair(pair)} selected in Assistant.`);
+  const toggleAccountSection = (key: AccountSectionKey) => {
+    setAccountSectionsOpen((current) => ({
+      ...current,
+      [key]: !current[key]
+    }));
+  };
+
+  const openSuggestionModal = (suggestion: BalanceSuggestion) => {
+    setActiveSuggestionKey(suggestion.key);
+    setActiveSuggestionOrderType(
+      suggestion.primaryOrderType ?? suggestion.templates[0]?.type ?? null
+    );
+    setCopiedSuggestionFieldKey(null);
+  };
+
+  const closeSuggestionModal = () => {
+    setActiveSuggestionKey(null);
+    setActiveSuggestionOrderType(null);
+    setCopiedSuggestionFieldKey(null);
+  };
+
+  const copySuggestionValue = async (value: string, key: string) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedSuggestionFieldKey(key);
+      window.setTimeout(() => {
+        setCopiedSuggestionFieldKey((current) => (current === key ? null : current));
+      }, 1400);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not copy the field value.";
+      pushDiagnostic("Suggestions", message);
+      setFeedback("Copy failed. See Diagnostics.");
+    }
+  };
+
+  const scrollToAssistant = (focusComposer: boolean) => {
+    setActiveTab("ASSISTANT");
+    assistantPanelRef.current?.scrollIntoView({
+      behavior: "smooth",
+      block: "start"
+    });
+
+    if (focusComposer) {
+      requestAnimationFrame(() => {
+        aiTextareaRef.current?.focus();
+      });
+    }
+  };
+
+  const buildSuggestionQuestion = (suggestion: BalanceSuggestion): string => {
+    const pairLabel = suggestion.marketPair ? formatPair(suggestion.marketPair) : suggestion.asset;
+    const statusLabel = suggestion.status.replace("_", " ");
+    const metricParts = [
+      suggestion.metrics.spreadBps !== null ? `spread ${roundTo(suggestion.metrics.spreadBps, 2)} bps` : null,
+      suggestion.metrics.deviationBps !== null ? `deviation ${roundTo(suggestion.metrics.deviationBps, 2)} bps` : null,
+      suggestion.metrics.netEdgeBps !== null ? `net edge ${roundTo(suggestion.metrics.netEdgeBps, 2)} bps` : null
+    ].filter(Boolean);
+    const valueParts = [
+      suggestion.quantity > 0 ? `qty ${formatDisplayQty(suggestion.quantity)}` : null,
+      suggestion.price !== null ? `price ${formatDisplayPrice(suggestion.price)}` : null,
+      suggestion.triggerPrice !== null ? `trigger ${formatDisplayPrice(suggestion.triggerPrice)}` : null,
+      suggestion.total > 0 ? `estimated total ${formatDisplayPrice(suggestion.total)}` : null
+    ].filter(Boolean);
+
+    return [
+      `Explain this ${suggestion.side.toLowerCase()} suggestion for ${pairLabel}.`,
+      `Status: ${statusLabel}.`,
+      suggestion.primaryOrderType ? `Primary order type: ${formatOrderTypeLabel(suggestion.primaryOrderType)}.` : null,
+      `Headline: ${suggestion.headline}`,
+      `Summary: ${suggestion.summary}`,
+      metricParts.length > 0 ? `Current metrics: ${metricParts.join(", ")}.` : null,
+      valueParts.length > 0 ? `Current order values: ${valueParts.join(", ")}.` : null,
+      suggestion.notes.length > 0 ? `Important notes: ${suggestion.notes.join(" ")}` : null,
+      "Please explain why this suggestion exists, what the important numbers mean, what risks I should watch, and what I should double-check in the Kraken form before I copy anything."
+    ]
+      .filter(Boolean)
+      .join(" ");
   };
 
   const clearAiAssistant = () => {
@@ -1159,15 +1352,20 @@ export function TradingAssistantShell() {
     setAiError(null);
     setAiAsOf(null);
     setAiResponse(null);
+    setAiSnapshotPayload(null);
   };
 
-  const sendAiAssistant = async () => {
-    if (aiSendDisabled) {
-      return;
+  const sendAiAssistant = async (overrideQuestion?: string): Promise<"sent" | "blocked" | "failed"> => {
+    const questionToSend = (overrideQuestion ?? aiQuestion).trim();
+    if (!questionToSend || aiLoading || aiCooldownUntilMs > Date.now()) {
+      return "blocked";
     }
 
     setAiLoading(true);
     setAiError(null);
+    if (overrideQuestion) {
+      setAiQuestion(questionToSend);
+    }
 
     try {
       const response = await fetch("/api/assistant/ai", {
@@ -1177,11 +1375,21 @@ export function TradingAssistantShell() {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          question: aiQuestion.trim(),
+          question: questionToSend,
           simpleLanguage: aiSimpleLanguage,
-          includeRawCandles: aiIncludeRawCandles
+          includeRawCandles: aiIncludeRawCandles,
+          includeSnapshot: true,
+          context: {
+            strategyParams: params
+          }
         })
       });
+
+      if (response.status === 401) {
+        redirectToLogin();
+        return "failed";
+      }
+
       const payload = await parseJson<AiApiPayload>(response);
 
       if (!response.ok || !payload.response) {
@@ -1190,33 +1398,773 @@ export function TradingAssistantShell() {
 
       setAiResponse(payload.response);
       setAiAsOf(payload.asOf ?? null);
+      setAiSnapshotPayload(payload.snapshot ?? null);
+      return "sent";
     } catch (error) {
-      setAiError(error instanceof Error ? error.message : "AI Assistant request failed.");
+      const message = error instanceof Error ? error.message : "AI Assistant request failed.";
+      setAiError(message);
+      setAiSnapshotPayload(null);
+      pushDiagnostic("Assistant", message);
+      return "failed";
     } finally {
       setAiLoading(false);
       setAiCooldownUntilMs(Date.now() + 5000);
     }
   };
 
+  const draftSuggestionQuestion = (suggestion: BalanceSuggestion) => {
+    const prompt = buildSuggestionQuestion(suggestion);
+    setAiQuestion(prompt);
+    scrollToAssistant(true);
+    setFeedback(`Drafted an Explain & Ask prompt for ${suggestion.marketPair ? formatPair(suggestion.marketPair) : suggestion.asset}.`);
+  };
+
+  const askAboutSuggestion = async (suggestion: BalanceSuggestion) => {
+    const prompt = buildSuggestionQuestion(suggestion);
+    setAiQuestion(prompt);
+    scrollToAssistant(false);
+    const result = await sendAiAssistant(prompt);
+
+    if (result === "blocked") {
+      setFeedback("AI request is cooling down. The prompt was drafted in Explain & Ask instead.");
+      scrollToAssistant(true);
+    }
+  };
+
   const sentimentTooltipHtml = buildTooltipHtml("Market Sentiment", [
     "score = median((last - open_reference) / open_reference) across selected pairs.",
-    "Risk-off if score <= -1.0%. Risk-on if score >= +1.0%. Otherwise Neutral.",
+    `Risk-off if score <= ${formatPctPrecise(SENTIMENT_RED_THRESHOLD_PCT)}. Risk-on if score >= ${formatPctPrecise(SENTIMENT_GREEN_THRESHOLD_PCT)}. Otherwise Neutral.`,
     `Reference used: ${sentiment.referenceLabel}.`
   ]);
+
+  const renderBalancesPanel = () => (
+    <section className="panel assistant-layout-item balances-item">
+      <div className="panel-inner">
+        <div className="card-head">
+          <h2>Balances</h2>
+          <div className="card-head-actions">
+            {accountHasIssue ? <span className="badge alert compact-chip">Data issue</span> : null}
+            <button className="action-button compact" onClick={() => togglePanel("balances")}>
+              {formatPanelStatusLabel(panelOpen.balances)}
+            </button>
+          </div>
+        </div>
+        {panelOpen.balances ? (
+          <>
+            <div className="subtle mono">
+              {positionsState?.checkedAt ? new Date(positionsState.checkedAt).toLocaleTimeString() : "n/a"} •{" "}
+              {positionsState?.cached.hit ? "cache hit" : "live"}
+            </div>
+            {!positionsState?.authenticated ? (
+              <div className="subtle inline-status text-reading">Not connected. Add Kraken API keys for live balance reads.</div>
+            ) : portfolioRows.length === 0 ? (
+              <div className="subtle inline-status text-reading">No positive balances found in the account.</div>
+            ) : (
+              <div className="table-wrap">
+                <table className="kv-table portfolio-table mono">
+                  <thead>
+                    <tr>
+                      <th>Asset</th>
+                      <th>Available</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {portfolioRows.map((row) => (
+                      <tr key={`portfolio-${row.asset}`}>
+                        <td>{row.asset}</td>
+                        <td className="balance">{roundTo(row.available, 8)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="subtle inline-status text-reading">Balances are collapsed.</div>
+        )}
+      </div>
+    </section>
+  );
+
+  const renderAccountPanel = () => (
+    <section className="panel assistant-layout-item account-item">
+      <div className="panel-inner">
+        <div className="card-head">
+          <h2>Account</h2>
+          <div className="card-head-actions">
+            {accountHasIssue ? <span className="badge alert compact-chip">Data issue</span> : null}
+            <button className="action-button compact" onClick={() => togglePanel("account")}>
+              {formatPanelStatusLabel(panelOpen.account)}
+            </button>
+          </div>
+        </div>
+        {panelOpen.account ? (
+        <div className="account-snapshot-stack">
+          <article className="panel account-table-card">
+            <div className="panel-inner">
+              <div className="card-head">
+                <h3>Open Orders</h3>
+                <button className="action-button compact" onClick={() => toggleAccountSection("openOrders")}>
+                  {formatPanelStatusLabel(accountSectionsOpen.openOrders)}
+                </button>
+              </div>
+              {accountSectionsOpen.openOrders ? (
+                positionsState?.openOrders.length ? (
+                  <div className="table-wrap">
+                    <table className="kv-table mono">
+                      <thead>
+                        <tr>
+                          <th>Pair</th>
+                          <th>Side</th>
+                          <th>Type</th>
+                          <th>Qty</th>
+                          <th>Price</th>
+                          <th>Opened</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {positionsState.openOrders.map((order) => (
+                          <tr key={order.orderId}>
+                            <td>{formatPair(order.pair)}</td>
+                            <td>{order.side}</td>
+                            <td>{order.type}</td>
+                            <td>{roundTo(order.qty, 8)}</td>
+                            <td>{roundTo(order.price, 8)}</td>
+                            <td>{formatShortDateTime(order.openedAt)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <div className="subtle inline-status text-reading">No open orders detected in Kraken.</div>
+                )
+              ) : (
+                <div className="subtle inline-status text-reading">Open orders table collapsed.</div>
+              )}
+            </div>
+          </article>
+
+          <article className="panel account-table-card">
+            <div className="panel-inner">
+              <div className="card-head">
+                <h3>Latest Activity</h3>
+                <button className="action-button compact" onClick={() => toggleAccountSection("latestActivity")}>
+                  {formatPanelStatusLabel(accountSectionsOpen.latestActivity)}
+                </button>
+              </div>
+              {accountSectionsOpen.latestActivity ? (
+                !positionsState?.authenticated ? (
+                  <div className="subtle inline-status text-reading">Not connected. Add Kraken API keys for read-only activity.</div>
+                ) : !positionsState.latestActivity ? (
+                  <div className="subtle inline-status text-reading">No recent activity found.</div>
+                ) : (
+                  <div className="table-wrap">
+                    <table className="kv-table mono">
+                      <thead>
+                        <tr>
+                          <th>Type</th>
+                          <th>Side</th>
+                          <th>Pair</th>
+                          <th>Price</th>
+                          <th>Qty</th>
+                          <th>Status</th>
+                          <th>Time</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td>{positionsState.latestActivity.type.toUpperCase()}</td>
+                          <td>{positionsState.latestActivity.side}</td>
+                          <td>{formatPair(positionsState.latestActivity.pair)}</td>
+                          <td>{roundTo(positionsState.latestActivity.price, 8)}</td>
+                          <td>{roundTo(positionsState.latestActivity.qty, 8)}</td>
+                          <td>{positionsState.latestActivity.status}</td>
+                          <td>{formatShortDateTime(positionsState.latestActivity.timestamp)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              ) : (
+                <div className="subtle inline-status text-reading">Latest activity table collapsed.</div>
+              )}
+            </div>
+          </article>
+        </div>
+        ) : (
+          <div className="subtle inline-status text-reading">Account is collapsed.</div>
+        )}
+      </div>
+    </section>
+  );
+
+  const renderSuggestionsPanel = () => (
+    <section className="panel assistant-layout-item suggestions-item">
+      <div className="panel-inner">
+        <div className="card-head">
+          <h2>Suggestions</h2>
+          <div className="card-head-actions">
+            {suggestionsHasIssue ? <span className="badge alert compact-chip">Data issue</span> : null}
+            <button className="action-button compact" onClick={() => togglePanel("suggestions")}>
+              {formatPanelStatusLabel(panelOpen.suggestions)}
+            </button>
+          </div>
+        </div>
+        {panelOpen.suggestions ? (
+        <>
+        <div className="subtle text-reading">One row per live balance. Click a row to open the Kraken copy form.</div>
+        <div className="subtle text-reading">Available is your current balance. Order Qty is the amount this suggestion would use in the proposed order.</div>
+        <div className="subtle text-reading">{feedback}</div>
+        {netEdgeSanity.viableUnreachable ? (
+          <div className="warning text-reading">
+            Your min net edge is unreachable unless spread is near 0. Max possible edge without spread is {formatBps(netEdgeSanity.maxPossibleNetEdgeNoSpreadPct)}
+            {" "}while min net edge is {formatBps(netEdgeSanity.minNetEdgePct)}.
+          </div>
+        ) : null}
+        {balanceSuggestions.length === 0 ? (
+          <div className="subtle inline-status text-reading">No positive balances found, so there are no balance-driven suggestions yet.</div>
+        ) : (
+          <div className="table-wrap">
+            <table className="kv-table mono suggestions-table">
+              <thead>
+                <tr>
+                  <th>Asset</th>
+                  <th>Available</th>
+                  <th>Pair</th>
+                  <th>Action</th>
+                  <th>Status</th>
+                  <th>Explain</th>
+                  <th>Kraken</th>
+                  <th>Snapshot</th>
+                  <th>Primary Order</th>
+                  <th>Order Qty</th>
+                  <th>Price</th>
+                  <th>Trigger</th>
+                  <th>Est. Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {balanceSuggestions.map((row) => (
+                  <tr
+                    key={row.key}
+                    className={`interactive-row suggestion-row ${row.side.toLowerCase()}`}
+                    onClick={() => openSuggestionModal(row)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        openSuggestionModal(row);
+                      }
+                    }}
+                    role="button"
+                    tabIndex={0}
+                  >
+                    <td className="suggestion-asset-cell">{row.asset}</td>
+                    <td className="numeric-cell">{formatDisplayAvailable(row.available)}</td>
+                    <td className="pair-cell">{row.marketPair ? formatPair(row.marketPair) : "n/a"}</td>
+                    <td>
+                      <span className={`badge compact-chip suggestion-side ${row.side.toLowerCase()}`}>
+                        {row.side}
+                      </span>
+                    </td>
+                    <td>
+                      <span className={`badge compact-chip suggestion-status ${row.status.toLowerCase()}`}>{row.status.replace("_", " ")}</span>
+                    </td>
+                    <td>
+                      <div className="table-action-stack suggestion-actions-cell">
+                        <button
+                          type="button"
+                          className="action-button compact"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            draftSuggestionQuestion(row);
+                          }}
+                        >
+                          Draft
+                        </button>
+                        <button
+                          type="button"
+                          className="action-button compact"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void askAboutSuggestion(row);
+                          }}
+                        >
+                          Ask
+                        </button>
+                      </div>
+                    </td>
+                    <td>
+                      {buildKrakenMarketUrl(row.marketPair) ? (
+                        <a
+                          className="action-button compact table-link-button suggestion-open-button"
+                          href={buildKrakenMarketUrl(row.marketPair) ?? "#"}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                          }}
+                        >
+                          Open
+                        </a>
+                      ) : (
+                        <span className="subtle">n/a</span>
+                      )}
+                    </td>
+                    <td className="snapshot-cell">
+                      <div className="suggestion-summary-cell">
+                        <strong>{row.headline}</strong>
+                        <span>{row.summary}</span>
+                      </div>
+                    </td>
+                    <td>{row.primaryOrderType ? formatOrderTypeLabel(row.primaryOrderType) : "n/a"}</td>
+                    <td className="numeric-cell">{row.quantity > 0 ? formatDisplayQty(row.quantity) : "n/a"}</td>
+                    <td className="numeric-cell">{formatDisplayPrice(row.price)}</td>
+                    <td className="numeric-cell">{formatDisplayPrice(row.triggerPrice)}</td>
+                    <td className="numeric-cell">{row.total > 0 ? formatDisplayPrice(row.total) : "n/a"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        </>
+        ) : (
+          <div className="subtle inline-status text-reading">Suggestions are collapsed.</div>
+        )}
+      </div>
+    </section>
+  );
+
+  const renderSentimentPanel = () => (
+    <section className="panel assistant-layout-item context-item">
+      <div className="panel-inner">
+        <div className="card-head">
+          <h2>Sentiment</h2>
+          <div className="card-head-actions">
+            {sentimentHasIssue ? <span className="badge alert compact-chip">Data issue</span> : null}
+            <button
+              type="button"
+              className="info-button"
+              data-tooltip-id={SENTIMENT_TOOLTIP_ID}
+              data-tooltip-html={sentimentTooltipHtml}
+              aria-label="Sentiment calculation details"
+            >
+              i
+            </button>
+            <Tooltip id={SENTIMENT_TOOLTIP_ID} className="assistant-tooltip" place="top" />
+            <button className="action-button compact" onClick={() => setPanelOpen((current) => ({ ...current, sentiment: !current.sentiment }))}>
+              {formatPanelStatusLabel(panelOpen.sentiment)}
+            </button>
+          </div>
+        </div>
+        {panelOpen.sentiment ? (
+          <div className="sentiment-panel-body">
+            <div className={`sentiment-pill ${sentiment.color.toLowerCase()}`}>{sentiment.label}</div>
+            <div className="kpi-value metric">
+              {formatPctPrecise(sentiment.scorePct)} ({formatBps(sentiment.scorePct)})
+            </div>
+            <div className="subtle mono">
+              Basket size: {sentiment.sampleSize} • Reference: {sentiment.referenceLabel}
+            </div>
+            <div className="subtle mono">
+              Thresholds: risk-off ≤ {formatPctPrecise(SENTIMENT_RED_THRESHOLD_PCT)} • risk-on ≥ {formatPctPrecise(SENTIMENT_GREEN_THRESHOLD_PCT)}
+            </div>
+          </div>
+        ) : (
+          <div className="subtle inline-status text-reading">Sentiment is collapsed.</div>
+        )}
+      </div>
+    </section>
+  );
+
+  const renderControlsPanel = () => (
+    <section className="panel assistant-layout-item controls-item strategy-panel">
+      <div className="panel-inner">
+        <div className="card-head">
+          <h2>Advanced Strategy</h2>
+          <div className="card-head-actions">
+            <button className="action-button compact" onClick={resetToDefaults}>
+              Reset to safe defaults
+            </button>
+            <button className="action-button compact" onClick={() => togglePanel("advancedStrategy")}>
+              {formatPanelStatusLabel(panelOpen.advancedStrategy)}
+            </button>
+          </div>
+        </div>
+        {panelOpen.advancedStrategy ? (
+          <>
+            <div className="subtle advanced-head text-reading">These settings stay collapsed by default so the account workflow stays primary.</div>
+            <div className="grid-two">
+              <ParameterField
+                tooltipKey="takeProfitPct"
+                label="take_profit_pct"
+                value={String(params.takeProfitPct)}
+                onChange={(value) => updateParam("takeProfitPct", parseDecimalInput(value))}
+                hint={pctHint(params.takeProfitPct)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="stopLossPct"
+                label="stop_loss_pct"
+                value={String(params.stopLossPct)}
+                onChange={(value) => updateParam("stopLossPct", parseDecimalInput(value))}
+                hint={pctHint(params.stopLossPct)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="maxHoldMinutes"
+                label="max_hold_minutes"
+                value={String(params.maxHoldMinutes)}
+                onChange={(value) => updateParam("maxHoldMinutes", Math.max(1, Math.trunc(parseDecimalInput(value))))}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <label className="field">
+                <span className="field-label-row">
+                  timeframe
+                  <TooltipInfoButton tooltipKey="timeframe" params={params} referencePrice={referencePrice} />
+                </span>
+                <select value={params.timeframe} onChange={(event) => updateParam("timeframe", event.target.value === "5m" ? "5m" : "5m")}>
+                  <option value="5m">5m</option>
+                </select>
+              </label>
+              <ParameterField
+                tooltipKey="maPeriod"
+                label="ma_period"
+                value={String(params.maPeriod)}
+                onChange={(value) => updateParam("maPeriod", Math.max(5, Math.trunc(parseDecimalInput(value))))}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="entryThresholdPct"
+                label="entry_threshold_pct"
+                value={String(params.entryThresholdPct)}
+                onChange={(value) => updateParam("entryThresholdPct", parseDecimalInput(value))}
+                hint={pctHint(params.entryThresholdPct)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="maxSpreadAllowedPct"
+                label="max_spread_allowed_pct"
+                value={String(params.maxSpreadAllowedPct)}
+                onChange={(value) => updateParam("maxSpreadAllowedPct", parseDecimalInput(value))}
+                hint={pctHint(params.maxSpreadAllowedPct)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="assumedFeePctRoundtrip"
+                label="assumed_fee_pct_roundtrip"
+                value={String(params.assumedFeePctRoundtrip)}
+                onChange={(value) => updateParam("assumedFeePctRoundtrip", parseDecimalInput(value))}
+                hint={pctHint(params.assumedFeePctRoundtrip)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="assumedSlippagePctRoundtrip"
+                label="assumed_slippage_pct_roundtrip"
+                value={String(params.assumedSlippagePctRoundtrip)}
+                onChange={(value) => updateParam("assumedSlippagePctRoundtrip", parseDecimalInput(value))}
+                hint={pctHint(params.assumedSlippagePctRoundtrip)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="minNetEdgePct"
+                label="min_net_edge_pct"
+                value={String(params.minNetEdgePct)}
+                onChange={(value) => updateParam("minNetEdgePct", parseDecimalInput(value))}
+                hint={pctHint(params.minNetEdgePct)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+              <ParameterField
+                tooltipKey="marginalNetEdgePct"
+                label="marginal_net_edge_pct"
+                value={String(params.marginalNetEdgePct)}
+                onChange={(value) => updateParam("marginalNetEdgePct", parseDecimalInput(value))}
+                hint={pctHint(params.marginalNetEdgePct)}
+                params={params}
+                referencePrice={referencePrice}
+              />
+            </div>
+          </>
+        ) : (
+          <div className="subtle inline-status text-reading">Advanced settings are hidden.</div>
+        )}
+      </div>
+    </section>
+  );
+
+  const renderAssistantPanel = () => (
+    <section ref={assistantPanelRef} className="panel assistant-layout-item assistant-item">
+      <div className="panel-inner">
+        <div className="card-head">
+          <h2>Explain & Ask</h2>
+          <div className="ai-actions">
+            {assistantHasIssue ? <span className="badge alert compact-chip">Data issue</span> : null}
+            <button className="action-button secondary compact" onClick={() => togglePanel("assistant")}>
+              {formatPanelStatusLabel(panelOpen.assistant)}
+            </button>
+            <button className="action-button secondary compact" onClick={() => setShowAiSnapshot((current) => !current)}>
+              {showAiSnapshot ? "Hide Snapshot" : "Show Snapshot"}
+            </button>
+            <button className="action-button secondary compact" onClick={clearAiAssistant}>
+              Clear
+            </button>
+          </div>
+        </div>
+        {panelOpen.assistant ? (
+        <>
+        <label className="field">
+          <span>Ask a question</span>
+          <textarea
+            ref={aiTextareaRef}
+            className="ai-input"
+            value={aiQuestion}
+            placeholder="Example: Which pairs are interesting to watch today and why?"
+            onChange={(event) => setAiQuestion(event.target.value)}
+          />
+        </label>
+        <div className="subtle text-reading">Use `Draft` or `Ask` from a suggestion row to turn that suggestion into a contextual Explain & Ask prompt.</div>
+
+        <div className="grid-three assistant-options">
+          <label className="check-row">
+            <input type="checkbox" checked={aiSimpleLanguage} onChange={(event) => setAiSimpleLanguage(event.target.checked)} />
+            <span>Use simple language</span>
+          </label>
+          <label className="check-row">
+            <input type="checkbox" checked={aiIncludeRawCandles} onChange={(event) => setAiIncludeRawCandles(event.target.checked)} />
+            <span>Include raw candles</span>
+          </label>
+          <div className="field">
+            <button className="action-button primary compact" disabled={aiSendDisabled} onClick={() => void sendAiAssistant()}>
+              {aiLoading ? "Thinking..." : aiCooldownRemainingSec > 0 ? `Wait ${aiCooldownRemainingSec}s` : "Send"}
+            </button>
+          </div>
+        </div>
+
+        {aiAsOf ? <div className="subtle mono">Snapshot timestamp: {aiAsOf}</div> : null}
+        {showAiSnapshot ? (
+          <div className="snapshot-viewer">
+            <div className="subtle mono">Snapshot payload sent to the AI route</div>
+            <pre className="snapshot-json">{aiSnapshotPayload ? JSON.stringify(aiSnapshotPayload, null, 2) : "No snapshot available yet."}</pre>
+          </div>
+        ) : null}
+
+        {aiResponse ? (
+          <div className="ai-output">
+            <h3>Answer</h3>
+            <p>{aiResponse.answer}</p>
+
+            <h3>Top candidates to consider</h3>
+            {aiResponse.top_candidates.length === 0 ? (
+              <div className="subtle text-reading">No candidates returned.</div>
+            ) : (
+              <div className="signal-grid">
+                {aiResponse.top_candidates.map((candidate) => (
+                  <article key={`ai-${candidate.pair}`} className="panel signal-card">
+                    <div className="panel-inner">
+                      <div className="card-head">
+                        <h4>{formatPair(candidate.pair)}</h4>
+                        <span className="badge compact-chip">{candidate.status}</span>
+                      </div>
+                      <div className="mini-grid mono">
+                        <div>{candidate.why_interesting}</div>
+                        <div>Spread: {roundTo(candidate.numbers.spread_bps, 2)} bps</div>
+                        <div>Deviation: {roundTo(candidate.numbers.deviation_bps, 2)} bps</div>
+                        <div>Net edge: {roundTo(candidate.numbers.net_edge_bps, 2)} bps</div>
+                        <div>Min-order OK: {candidate.feasibility.min_order_ok ? "Yes" : "No"}</div>
+                        <div>Feasibility notes: {candidate.feasibility.notes.join(" | ")}</div>
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+
+            <h3>What could go wrong</h3>
+            <ul className="flat-list">
+              {aiResponse.risks.map((risk) => (
+                <li key={risk}>{risk}</li>
+              ))}
+            </ul>
+
+            <h3>Learning corner</h3>
+            <ul className="flat-list">
+              {aiResponse.learning_corner.map((item) => (
+                <li key={item.term}>
+                  <strong>{item.term}:</strong> {item.simple}
+                </li>
+              ))}
+            </ul>
+
+            <div className="subtle text-reading">{aiResponse.disclaimer}</div>
+          </div>
+        ) : (
+          <div className="subtle text-reading">Ask a freeform question to get a grounded, educational summary from the current snapshot.</div>
+        )}
+        </>
+        ) : (
+          <div className="subtle inline-status text-reading">Explain & Ask is collapsed.</div>
+        )}
+      </div>
+    </section>
+  );
+
+  const renderSuggestionModal = () => {
+    const suggestion = activeBalanceSuggestion;
+    const activeTemplate =
+      suggestion?.templates.find((template) => template.type === activeSuggestionOrderType) ??
+      suggestion?.templates[0] ??
+      null;
+    const krakenUrl = buildKrakenMarketUrl(suggestion?.marketPair ?? null);
+
+    return (
+      <Modal
+        isOpen={Boolean(suggestion)}
+        onRequestClose={closeSuggestionModal}
+        className="kraken-modal"
+        overlayClassName="kraken-modal-overlay"
+        contentLabel="Kraken suggestion form"
+      >
+        {suggestion ? (
+          <div className="kraken-modal-shell">
+            <div className="kraken-modal-head">
+              <div>
+                <div className="subtle mono">Kraken copy form</div>
+                <h2>{suggestion.marketPair ? formatPair(suggestion.marketPair) : suggestion.asset}</h2>
+              </div>
+              <div className="kraken-modal-head-actions">
+                {krakenUrl ? (
+                  <a className="kraken-open-link" href={krakenUrl} target="_blank" rel="noreferrer">
+                    Open Kraken
+                  </a>
+                ) : null}
+                <button className="kraken-close-button" onClick={closeSuggestionModal}>
+                  x
+                </button>
+              </div>
+            </div>
+
+            <div className="kraken-segment-row">
+              <button className={`kraken-segment ${suggestion.side === "BUY" ? "active buy" : ""}`}>Kopen</button>
+              <button className={`kraken-segment ${suggestion.side === "SELL" ? "active sell" : ""}`}>Verkopen</button>
+            </div>
+
+            <div className="kraken-order-type-row">
+              {suggestion.templates.length === 0 ? (
+                <div className="subtle text-reading">No order templates available for this balance.</div>
+              ) : (
+                suggestion.templates.map((template) => (
+                  <button
+                    key={`${suggestion.key}-${template.type}`}
+                    className={`kraken-order-type ${template.type === activeTemplate?.type ? "active" : ""}`}
+                    onClick={() => setActiveSuggestionOrderType(template.type)}
+                  >
+                    {formatOrderTypeLabel(template.type)}
+                  </button>
+                ))
+              )}
+            </div>
+
+            {activeTemplate ? (
+              <>
+                <div className="kraken-balance-strip">
+                  <div className="subtle">Beschikbaar tegoed</div>
+                  <div className="kraken-balance-value">{activeTemplate.availableText}</div>
+                </div>
+
+                <div className="kraken-form-grid">
+                  {activeTemplate.fields.map((field) => (
+                    <div key={`${activeTemplate.type}-${field.label}`} className="kraken-field-card">
+                      <div className="kraken-field-head">
+                        <div className="kraken-field-label">{field.label}</div>
+                        <button
+                          type="button"
+                          className="kraken-copy-button"
+                          onClick={() => copySuggestionValue(field.value, `${activeTemplate.type}-${field.label}`)}
+                        >
+                          {copiedSuggestionFieldKey === `${activeTemplate.type}-${field.label}` ? "Copied" : "Copy"}
+                        </button>
+                      </div>
+                      <div className="kraken-field-value">
+                        <span>{field.value}</span>
+                        {field.unit ? <span className="kraken-field-unit">{field.unit}</span> : null}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="kraken-meta-row">
+                  <div>
+                    TP/SL <strong>{activeTemplate.tpSlEnabled ? "Ja" : "Nee"}</strong>
+                  </div>
+                  <div>
+                    Trailing mode <strong>{activeTemplate.tpSlMode ?? "n/a"}</strong>
+                  </div>
+                </div>
+
+                <button className={`kraken-submit-button ${suggestion.side === "SELL" ? "sell" : "buy"}`}>
+                  {activeTemplate.submitLabel}
+                </button>
+
+                <div className="kraken-notes">
+                  <div className="subtle text-reading">Why this template</div>
+                  <ul className="flat-list">
+                    {[suggestion.summary, ...suggestion.notes, ...activeTemplate.notes].slice(0, 5).map((note) => (
+                      <li key={`${suggestion.key}-${activeTemplate.type}-${note}`}>{note}</li>
+                    ))}
+                  </ul>
+                </div>
+              </>
+            ) : (
+              <div className="warning text-reading">No actionable order template is available for this balance yet.</div>
+            )}
+          </div>
+        ) : null}
+      </Modal>
+    );
+  };
+
+  const renderDiagnosticsPanel = () => (
+    <section className="panel assistant-layout-item diagnostics-item">
+      <div className="panel-inner">
+        <details className="diagnostics-drawer" open={diagnosticsOpen} onToggle={(event) => setDiagnosticsOpen(event.currentTarget.open)}>
+          <summary>
+            Diagnostics {diagnostics.length > 0 ? <span className="badge alert compact-chip">{diagnostics.length}</span> : null}
+          </summary>
+          <div className="diagnostics-actions">
+            <button className="action-button compact" onClick={() => setDiagnostics([])}>
+              Clear Diagnostics
+            </button>
+          </div>
+          {diagnostics.length === 0 ? (
+            <div className="subtle text-reading">No diagnostics logged.</div>
+          ) : (
+            <ul className="flat-list mono">
+              {diagnostics.map((entry) => (
+                <li key={entry.id}>
+                  [{entry.at}] {entry.scope}: {entry.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </details>
+      </div>
+    </section>
+  );
 
   return (
     <main className="page-shell">
       <div className="page-frame">
-        <section className="hero">
-          <h1>Fiat Buffer Trading Assistant</h1>
-          <p>Deterministic trade suggestions and read-only autopilot monitoring for manually placed Kraken trades.</p>
-          <div className="badge-row">
-            <span className="badge">Mode: Manual Autopilot</span>
-            <span className="badge">Kraken Orders: Read-only</span>
-            <span className="badge alert">AI suggestion: coming later</span>
-          </div>
-        </section>
-
         <section className="tabs-row">
           <button className={`tab-button ${activeTab === "ASSISTANT" ? "active" : ""}`} onClick={() => setActiveTab("ASSISTANT")}>
             Assistant
@@ -1238,806 +2186,38 @@ export function TradingAssistantShell() {
               >
                 Kraken
               </button>
+              <button className="action-button compact" onClick={refreshAccountSnapshot} disabled={refreshingAccountSnapshot}>
+                {refreshingAccountSnapshot ? "Refreshing..." : "Refresh Kraken"}
+              </button>
             </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <h2>Assistant Overview</h2>
-                <div className="grid-two">
-                  <article className="panel">
-                    <div className="panel-inner">
-                      <h3>Inputs</h3>
-                      <div className="grid-four">
-                        <label className="field">
-                          <span>Trading Capital (TC)</span>
-                          <input
-                            type="text"
-                            inputMode="decimal"
-                            value={tradingCapitalInput}
-                            onChange={(event) => setTradingCapitalInput(event.target.value)}
-                          />
-                          <small>Quote currency: {quoteAsset}</small>
-                        </label>
-
-                        <div className="field">
-                          <span>Pair selector (1-3)</span>
-                          <div className="checklist">
-                            {DEFAULT_ASSISTANT_PAIRS.map((pair) => (
-                              <label key={pair} className="check-row">
-                                <input type="checkbox" checked={selectedPairs.includes(pair)} onChange={() => togglePair(pair)} />
-                                <span>{formatPair(pair)}</span>
-                              </label>
-                            ))}
-                          </div>
-                        </div>
-
-                        <div className="field">
-                          <span>Notifications</span>
-                          <button className="action-button" onClick={requestNotifications}>
-                            Enable Browser Notifications
-                          </button>
-                          <small>Permission: {notificationPermission}</small>
-                        </div>
-
-                        <label className="field">
-                          <span>Learning Mode</span>
-                          <select value={learningMode ? "ON" : "OFF"} onChange={(event) => setLearningMode(event.target.value === "ON")}>
-                            <option value="ON">On</option>
-                            <option value="OFF">Off</option>
-                          </select>
-                          <small>{learningMode ? "Simplified card view with progressive detail." : "Full detailed card view."}</small>
-                        </label>
-                      </div>
-                    </div>
-                  </article>
-
-                  <article className="panel">
-                    <div className="panel-inner">
-                      <div className="grid-two">
-                        <article className="panel">
-                          <div className="panel-inner">
-                            <div className="card-head">
-                              <h3>Market Sentiment</h3>
-                              <button
-                                type="button"
-                                className="info-button"
-                                data-tooltip-id={SENTIMENT_TOOLTIP_ID}
-                                data-tooltip-html={sentimentTooltipHtml}
-                                aria-label="Sentiment calculation details"
-                              >
-                                i
-                              </button>
-                              <Tooltip id={SENTIMENT_TOOLTIP_ID} className="assistant-tooltip" place="top" />
-                            </div>
-                            <div className={`sentiment-pill ${sentiment.color.toLowerCase()}`}>{sentiment.label}</div>
-                            <div className="kpi-value mono">
-                              {formatPctPrecise(sentiment.scorePct)} ({formatBps(sentiment.scorePct)})
-                            </div>
-                            <div className="subtle mono">
-                              Basket size: {sentiment.sampleSize} • Reference: {sentiment.referenceLabel}
-                            </div>
-                          </div>
-                        </article>
-
-                        <article className="panel">
-                          <div className="panel-inner">
-                            <h3>Latest Activity</h3>
-                            {!positionsState?.authenticated ? (
-                              <div className="warning">Not connected. Add Kraken API keys for read-only order/trade monitoring.</div>
-                            ) : !positionsState.latestActivity ? (
-                              <div className="subtle">No recent activity.</div>
-                            ) : (
-                              <div className="mini-grid mono">
-                                <div>Type: {positionsState.latestActivity.type.toUpperCase()}</div>
-                                <div>Side: {positionsState.latestActivity.side}</div>
-                                <div>Pair: {formatPair(positionsState.latestActivity.pair)}</div>
-                                <div>Price: {roundTo(positionsState.latestActivity.price, 8)}</div>
-                                <div>Qty: {roundTo(positionsState.latestActivity.qty, 8)}</div>
-                                <div>Status: {positionsState.latestActivity.status}</div>
-                                <div>Time: {positionsState.latestActivity.timestamp}</div>
-                                <div>Source: {positionsState.latestActivity.source}</div>
-                              </div>
-                            )}
-                          </div>
-                        </article>
-                      </div>
-                    </div>
-                  </article>
-                </div>
-
-                <article className="panel">
-                  <div className="panel-inner">
-                    <div className="card-head">
-                      <h3>Kraken Portfolio</h3>
-                      <span className="subtle mono">
-                        Refreshed {positionsState?.checkedAt ? new Date(positionsState.checkedAt).toLocaleTimeString() : "n/a"} •{" "}
-                        {positionsState?.cached.hit ? "cache hit" : "live"}
-                      </span>
-                    </div>
-                    {!positionsState?.authenticated ? (
-                      <div className="warning">Not connected. Add Kraken API keys to read your live portfolio balances.</div>
-                    ) : portfolioRows.length === 0 ? (
-                      <div className="subtle">No positive balances found in the Kraken account.</div>
-                    ) : (
-                      <div className="table-wrap">
-                        <table className="kv-table portfolio-table mono">
-                          <thead>
-                            <tr>
-                              <th>Asset</th>
-                              <th>Available</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {portfolioRows.map((row) => (
-                              <tr key={`portfolio-${row.asset}`}>
-                                <td>{row.asset}</td>
-                                <td>{roundTo(row.available, 8)}</td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
-                  </div>
-                </article>
+            <div className="assistant-header-grid">
+              <div className="assistant-top-stack">
+                {renderBalancesPanel()}
+                {renderSuggestionsPanel()}
               </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <div className="card-head">
-                  <h2>AI Assistant</h2>
-                  <div className="ai-actions">
-                    <button className="action-button secondary" onClick={clearAiAssistant}>
-                      Clear
-                    </button>
-                  </div>
-                </div>
-
-                <label className="field">
-                  <span>Ask a question</span>
-                  <textarea
-                    className="ai-input"
-                    value={aiQuestion}
-                    placeholder="Example: Which pairs are interesting to watch today and why?"
-                    onChange={(event) => setAiQuestion(event.target.value)}
-                  />
-                </label>
-
-                <div className="grid-three">
-                  <label className="check-row">
-                    <input
-                      type="checkbox"
-                      checked={aiSimpleLanguage}
-                      onChange={(event) => setAiSimpleLanguage(event.target.checked)}
-                    />
-                    <span>Use simple language</span>
-                  </label>
-                  <label className="check-row">
-                    <input
-                      type="checkbox"
-                      checked={aiIncludeRawCandles}
-                      onChange={(event) => setAiIncludeRawCandles(event.target.checked)}
-                    />
-                    <span>Include raw candles</span>
-                  </label>
-                  <div className="field">
-                    <button className="action-button primary" disabled={aiSendDisabled} onClick={sendAiAssistant}>
-                      {aiLoading ? "Thinking..." : aiCooldownRemainingSec > 0 ? `Wait ${aiCooldownRemainingSec}s` : "Send"}
-                    </button>
-                  </div>
-                </div>
-
-                {aiAsOf ? <div className="subtle mono">Snapshot timestamp: {aiAsOf}</div> : null}
-                {aiError ? <div className="warning">{aiError}</div> : null}
-
-                {aiResponse ? (
-                  <div className="ai-output">
-                    <h3>Answer</h3>
-                    <p>{aiResponse.answer}</p>
-
-                    <h3>Top candidates to consider</h3>
-                    {aiResponse.top_candidates.length === 0 ? (
-                      <div className="subtle">No candidates returned.</div>
-                    ) : (
-                      <div className="grid-two">
-                        {aiResponse.top_candidates.map((candidate) => (
-                          <article key={`ai-${candidate.pair}`} className="panel">
-                            <div className="panel-inner">
-                              <div className="card-head">
-                                <h4>{formatPair(candidate.pair)}</h4>
-                                <span className="badge">{candidate.status}</span>
-                              </div>
-                              <div className="mini-grid mono">
-                                <div>{candidate.why_interesting}</div>
-                                <div>Spread: {roundTo(candidate.numbers.spread_bps, 2)} bps</div>
-                                <div>Deviation: {roundTo(candidate.numbers.deviation_bps, 2)} bps</div>
-                                <div>Net edge: {roundTo(candidate.numbers.net_edge_bps, 2)} bps</div>
-                                <div>Min-order OK: {candidate.feasibility.min_order_ok ? "Yes" : "No"}</div>
-                                <div>Feasibility notes: {candidate.feasibility.notes.join(" | ")}</div>
-                                <div>
-                                  Simulate only: entry {roundTo(candidate.if_user_wants_to_simulate.entry, 8)}, tp{" "}
-                                  {roundTo(candidate.if_user_wants_to_simulate.tp, 8)}, sl{" "}
-                                  {roundTo(candidate.if_user_wants_to_simulate.sl, 8)}
-                                </div>
-                                <div>
-                                  Notional {roundTo(candidate.if_user_wants_to_simulate.notional, 8)}, qty{" "}
-                                  {roundTo(candidate.if_user_wants_to_simulate.qty, 8)}
-                                </div>
-                              </div>
-                            </div>
-                          </article>
-                        ))}
-                      </div>
-                    )}
-
-                    <h3>What could go wrong</h3>
-                    <ul className="flat-list">
-                      {aiResponse.risks.map((risk) => (
-                        <li key={risk}>{risk}</li>
-                      ))}
-                    </ul>
-
-                    <h3>Learning corner</h3>
-                    <ul className="flat-list">
-                      {aiResponse.learning_corner.map((item) => (
-                        <li key={item.term}>
-                          <strong>{item.term}:</strong> {item.simple}
-                        </li>
-                      ))}
-                    </ul>
-
-                    <div className="subtle">{aiResponse.disclaimer}</div>
-                  </div>
-                ) : (
-                  <div className="subtle">Ask a freeform question to get a grounded, educational summary from the current snapshot.</div>
-                )}
+              <div className="assistant-top-right">
+                {renderSentimentPanel()}
               </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <div className="card-head">
-                  <h2>Strategy Parameters</h2>
-                  <button className="action-button" onClick={resetToDefaults}>
-                    Reset to safe defaults
-                  </button>
-                </div>
-                <div className="grid-four">
-                  <ParameterField
-                    tooltipKey="takeProfitPct"
-                    label="take_profit_pct"
-                    value={String(params.takeProfitPct)}
-                    onChange={(value) => updateParam("takeProfitPct", parseDecimalInput(value))}
-                    hint={pctHint(params.takeProfitPct)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="stopLossPct"
-                    label="stop_loss_pct"
-                    value={String(params.stopLossPct)}
-                    onChange={(value) => updateParam("stopLossPct", parseDecimalInput(value))}
-                    hint={pctHint(params.stopLossPct)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="maxHoldMinutes"
-                    label="max_hold_minutes"
-                    value={String(params.maxHoldMinutes)}
-                    onChange={(value) => updateParam("maxHoldMinutes", Math.max(1, Math.trunc(parseDecimalInput(value))))}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <label className="field">
-                    <span className="field-label-row">
-                      timeframe
-                      <TooltipInfoButton tooltipKey="timeframe" params={params} referencePrice={referencePrice} />
-                    </span>
-                    <select value={params.timeframe} onChange={(event) => updateParam("timeframe", event.target.value === "5m" ? "5m" : "5m")}>
-                      <option value="5m">5m</option>
-                    </select>
-                  </label>
-                  <ParameterField
-                    tooltipKey="maPeriod"
-                    label="ma_period"
-                    value={String(params.maPeriod)}
-                    onChange={(value) => updateParam("maPeriod", Math.max(5, Math.trunc(parseDecimalInput(value))))}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="entryThresholdPct"
-                    label="entry_threshold_pct"
-                    value={String(params.entryThresholdPct)}
-                    onChange={(value) => updateParam("entryThresholdPct", parseDecimalInput(value))}
-                    hint={pctHint(params.entryThresholdPct)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="maxSpreadAllowedPct"
-                    label="max_spread_allowed_pct"
-                    value={String(params.maxSpreadAllowedPct)}
-                    onChange={(value) => updateParam("maxSpreadAllowedPct", parseDecimalInput(value))}
-                    hint={pctHint(params.maxSpreadAllowedPct)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="assumedFeePctRoundtrip"
-                    label="assumed_fee_pct_roundtrip"
-                    value={String(params.assumedFeePctRoundtrip)}
-                    onChange={(value) => updateParam("assumedFeePctRoundtrip", parseDecimalInput(value))}
-                    hint={pctHint(params.assumedFeePctRoundtrip)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="assumedSlippagePctRoundtrip"
-                    label="assumed_slippage_pct_roundtrip"
-                    value={String(params.assumedSlippagePctRoundtrip)}
-                    onChange={(value) => updateParam("assumedSlippagePctRoundtrip", parseDecimalInput(value))}
-                    hint={pctHint(params.assumedSlippagePctRoundtrip)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="minNetEdgePct"
-                    label="min_net_edge_pct"
-                    value={String(params.minNetEdgePct)}
-                    onChange={(value) => updateParam("minNetEdgePct", parseDecimalInput(value))}
-                    hint={pctHint(params.minNetEdgePct)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                  <ParameterField
-                    tooltipKey="marginalNetEdgePct"
-                    label="marginal_net_edge_pct"
-                    value={String(params.marginalNetEdgePct)}
-                    onChange={(value) => updateParam("marginalNetEdgePct", parseDecimalInput(value))}
-                    hint={pctHint(params.marginalNetEdgePct)}
-                    params={params}
-                    referencePrice={referencePrice}
-                  />
-                </div>
+            </div>
+            <div className="assistant-layout-grid">
+              <div className="assistant-main-column">
+                {renderAssistantPanel()}
               </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <div className="card-head">
-                  <h2>Deterministic Suggestions</h2>
-                  {learningMode ? <span className="badge">Learning Mode</span> : null}
-                </div>
-                <div className="subtle mono">{feedback}</div>
-                <div className="grid-two">
-                  {suggestions.map((suggestion) => {
-                    const market = getMarketPair(suggestion.pair);
-                    const ticker = liveTickers[suggestion.pair] ?? market?.ticker ?? null;
-                    const currentPosition = positionByPair.get(suggestion.pair);
-                    const deadlineMs = currentPosition
-                      ? Date.parse(currentPosition.openedAt) + params.maxHoldMinutes * 60_000
-                      : null;
-                    const remainingMinutes = deadlineMs ? Math.max(0, (deadlineMs - Date.now()) / 60_000) : null;
-                    const decisionLabel =
-                      suggestion.decision === "DO_NOT_TRADE"
-                        ? "DO NOT TRADE"
-                        : suggestion.decision;
-                    const decisionClass =
-                      suggestion.decision === "BUY"
-                        ? "decision-buy"
-                        : suggestion.decision === "DO_NOT_TRADE"
-                          ? "decision-no-trade"
-                          : "decision-wait";
-                    const why = suggestion.whyBullets.length
-                      ? suggestion.whyBullets.slice(0, 3)
-                      : suggestion.reasons.slice(0, 3);
-                    const checklist = [
-                      {
-                        label: `Net edge must be ≥ min_net_edge_pct (${formatPct(suggestion.buyChecklist.netEdge.requiredPct, 3)})`,
-                        met: suggestion.buyChecklist.netEdge.met,
-                        detail: `Current: ${formatPctPrecise(suggestion.buyChecklist.netEdge.currentPct)}`
-                      },
-                      {
-                        label: `Spread must be ≤ max_spread_allowed_pct (${formatPct(suggestion.buyChecklist.spread.requiredPct, 3)})`,
-                        met: suggestion.buyChecklist.spread.met,
-                        detail: `Current: ${formatPctPrecise(suggestion.buyChecklist.spread.currentPct)}`
-                      },
-                      {
-                        label: `Deviation must be ≥ entry_threshold_pct (${formatPct(suggestion.buyChecklist.deviation.requiredPct, 3)})`,
-                        met: suggestion.buyChecklist.deviation.met,
-                        detail: `Current: ${formatPctPrecise(suggestion.buyChecklist.deviation.currentPct)}`
-                      }
-                    ];
-                    const draft = executedDrafts[suggestion.pair] ?? {
-                      marked: false,
-                      entryPrice: "",
-                      qty: "",
-                      openedAt: nowDateTimeLocal()
-                    };
-
-                    const advancedSections = (
-                      <>
-                        <div className="mini-grid mono">
-                          <div>
-                            Viability <TermHelpButton term="viability" onOpen={openGlossaryTerm} label="viability" />: {suggestion.viability}
-                          </div>
-                          <div>
-                            Signal <TermHelpButton term="signal" onOpen={openGlossaryTerm} label="signal" />:{" "}
-                            {suggestion.signalDetected ? "YES" : "NO"}
-                          </div>
-                          <div>
-                            Deviation vs MA <TermHelpButton term="deviation" onOpen={openGlossaryTerm} label="deviation vs MA" />:{" "}
-                            {formatPctPrecise(suggestion.deviationPct)}
-                          </div>
-                        </div>
-
-                        <h4>Why</h4>
-                        <ul className="flat-list mono">
-                          {why.map((reason) => (
-                            <li key={reason}>{reason}</li>
-                          ))}
-                        </ul>
-
-                        <h4>What Needs To Change To BUY</h4>
-                        <ul className="flat-list mono">
-                          {checklist.map((item) => (
-                            <li key={item.label} className={item.met ? "check-pass" : "check-fail"}>
-                              {item.met ? "✓" : "•"} {item.label} ({item.detail})
-                            </li>
-                          ))}
-                        </ul>
-
-                        <details className="entry-details">
-                          <summary>If you decide to enter anyway</summary>
-                          <div className="mini-grid mono">
-                            <div>Suggested entry type: {suggestion.entryType}</div>
-                            <div>
-                              Entry price: {suggestion.entryPrice ?? "n/a"} <TermHelpButton term="mid" onOpen={openGlossaryTerm} label="mid" />
-                            </div>
-                            <div>
-                              TP price: {suggestion.tpPrice ?? "n/a"} <TermHelpButton term="tp" onOpen={openGlossaryTerm} label="TP" />
-                            </div>
-                            <div>
-                              SL price: {suggestion.slPrice ?? "n/a"} <TermHelpButton term="sl" onOpen={openGlossaryTerm} label="SL" />
-                            </div>
-                            <div>
-                              Suggested notional: {roundTo(suggestion.suggestedNotional, 6)}{" "}
-                              <TermHelpButton term="notional" onOpen={openGlossaryTerm} label="notional" />
-                            </div>
-                            <div>
-                              Suggested qty: {roundTo(suggestion.suggestedQty, 8)}{" "}
-                              <TermHelpButton term="quantity" onOpen={openGlossaryTerm} label="quantity" />
-                            </div>
-                          </div>
-
-                          <div className="execution-mark">
-                            <button className="action-button" onClick={() => markExecuted(suggestion.pair, suggestion.entryPrice, suggestion.suggestedQty)}>
-                              Mark Executed
-                            </button>
-                            {draft.marked ? (
-                              <button className="action-button danger" onClick={() => updateExecuted(suggestion.pair, { marked: false })}>
-                                Clear Executed Mark
-                              </button>
-                            ) : null}
-                          </div>
-
-                          {draft.marked ? (
-                            <div className="grid-three">
-                              <label className="field">
-                                <span>Executed entry price</span>
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={draft.entryPrice}
-                                  onChange={(event) => updateExecuted(suggestion.pair, { entryPrice: event.target.value })}
-                                />
-                              </label>
-                              <label className="field">
-                                <span>Executed qty</span>
-                                <input
-                                  type="text"
-                                  inputMode="decimal"
-                                  value={draft.qty}
-                                  onChange={(event) => updateExecuted(suggestion.pair, { qty: event.target.value })}
-                                />
-                              </label>
-                              <label className="field">
-                                <span>Entry time</span>
-                                <input
-                                  type="datetime-local"
-                                  value={draft.openedAt}
-                                  onChange={(event) => updateExecuted(suggestion.pair, { openedAt: event.target.value })}
-                                />
-                              </label>
-                            </div>
-                          ) : null}
-
-                          {currentPosition && deadlineMs ? (
-                            <div className="warning">
-                              Time stop <TermHelpButton term="timeStop" onOpen={openGlossaryTerm} label="time stop" /> deadline:{" "}
-                              {new Date(deadlineMs).toLocaleString()}. Minutes remaining: {roundTo(remainingMinutes ?? 0, 2)}.
-                            </div>
-                          ) : null}
-                        </details>
-
-                        <h4>Cost Breakdown</h4>
-                        <div className="mini-grid mono">
-                          <div>
-                            Spread <TermHelpButton term="spread" onOpen={openGlossaryTerm} label="spread" />: {formatBps(suggestion.cost.spreadPct)} (
-                            {formatPctPrecise(suggestion.cost.spreadPct)})
-                          </div>
-                          <div>
-                            Fees <TermHelpButton term="fee" onOpen={openGlossaryTerm} label="fee" /> roundtrip: {formatBps(suggestion.cost.feePct)} (
-                            {formatPctPrecise(suggestion.cost.feePct)})
-                          </div>
-                          <div>
-                            Slippage <TermHelpButton term="slippage" onOpen={openGlossaryTerm} label="slippage" /> estimate:{" "}
-                            {formatBps(suggestion.cost.slippagePct)} ({formatPctPrecise(suggestion.cost.slippagePct)})
-                          </div>
-                          <div>
-                            Net edge <TermHelpButton term="netEdge" onOpen={openGlossaryTerm} label="net edge" />: {formatBps(suggestion.cost.netEdgePct)} (
-                            {formatPctPrecise(suggestion.cost.netEdgePct)})
-                          </div>
-                        </div>
-                        <div className="subtle mono">
-                          net_edge = take_profit_pct − (spread_pct + fee_pct + slippage_pct)
-                        </div>
-
-                        {suggestion.viability === "NOT_VIABLE" ? (
-                          <div className="warning">
-                            {suggestion.blockingReasons.slice(0, 3).map((reason) => (
-                              <div key={reason}>{reason}</div>
-                            ))}
-                          </div>
-                        ) : null}
-
-                        {market?.error ? <div className="warning">Market warning: {market.error}</div> : null}
-                        {ticker ? (
-                          <div className="subtle mono">
-                            Live ticker: bid {roundTo(ticker.bid, 6)} / ask {roundTo(ticker.ask, 6)} / mid{" "}
-                            {roundTo((ticker.bid + ticker.ask) / 2, 6)}
-                          </div>
-                        ) : (
-                          <div className="warning">Live ticker unavailable.</div>
-                        )}
-
-                        <div className="ai-placeholder">
-                          <strong>AI suggestion</strong>
-                          <div className="subtle">AI suggestion coming later.</div>
-                        </div>
-                      </>
-                    );
-
-                    return (
-                      <article key={suggestion.pair} className="panel suggestion-card">
-                        <div className="panel-inner">
-                          <div className="card-head">
-                            <h3>{formatPair(suggestion.pair)}</h3>
-                            <span className={`decision-banner ${decisionClass}`}>{decisionLabel}</span>
-                          </div>
-
-                          {learningMode ? (
-                            <>
-                              <div className="simple-reason mono">{getSimpleReason(suggestion)}</div>
-                              <div className="next-step">{getNextStep(suggestion)}</div>
-                              <details className="entry-details">
-                                <summary>Show details</summary>
-                                {advancedSections}
-                              </details>
-                            </>
-                          ) : (
-                            advancedSections
-                          )}
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
+              <div className="assistant-side-column">
+                {renderAccountPanel()}
+                {renderControlsPanel()}
+                {renderDiagnosticsPanel()}
               </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <div className="card-head">
-                  <h2>Opportunities (Scanner)</h2>
-                  {sentiment.classification === "RISK_OFF" ? <span className="badge alert">Market is risk-off: be extra selective</span> : null}
-                </div>
-
-                <div className="grid-three">
-                  <div className="field">
-                    <span>Available {quoteAsset} balance</span>
-                    {positionsState?.authenticated && detectedQuoteBalance !== null ? (
-                      <small>Detected read-only balance: {roundTo(detectedQuoteBalance, 8)} {quoteAsset}</small>
-                    ) : (
-                      <small>Not connected. Using manual value.</small>
-                    )}
-                    <input
-                      type="text"
-                      inputMode="decimal"
-                      value={scannerBalanceOverride}
-                      placeholder={String(roundTo(scannerBalance, 8))}
-                      onChange={(event) => setScannerBalanceOverride(event.target.value)}
-                    />
-                    <small>Effective scanner balance: {roundTo(scannerBalance, 8)} {quoteAsset}</small>
-                  </div>
-
-                  <div className="field">
-                    <span>Scanner watchlist</span>
-                    <div className="checklist">
-                      {DEFAULT_ASSISTANT_PAIRS.map((pair) => (
-                        <label key={`scanner-${pair}`} className="check-row">
-                          <input type="checkbox" checked={scannerWatchlist.includes(pair)} onChange={() => toggleScannerPair(pair)} />
-                          <span>{formatPair(pair)}</span>
-                        </label>
-                      ))}
-                    </div>
-                    <small>Deterministic ranking only. No execution.</small>
-                  </div>
-                </div>
-
-                <div className="subtle">Deterministic scanner, not financial advice.</div>
-                {scannerTop.length === 0 ? (
-                  <div className="warning">
-                    {sentiment.classification === "RISK_OFF"
-                      ? "No safe opportunities right now."
-                      : "No eligible opportunities right now (constraints, costs, or affordability)."}
-                  </div>
-                ) : (
-                  <div className="grid-two">
-                    {scannerTop.map((row) => (
-                      <article key={`scanner-${row.pair}`} className="panel">
-                        <div className="panel-inner">
-                          <div className="card-head">
-                            <h3>{formatPair(row.pair)}</h3>
-                            <span className="badge">Score {roundTo(row.scoreScaled / 100_000, 2)}</span>
-                          </div>
-                          <div className="mini-grid mono">
-                            <div>Decision: {row.suggestion.decision === "DO_NOT_TRADE" ? "DO NOT TRADE" : row.suggestion.decision}</div>
-                            <div>Viability: {row.suggestion.viability}</div>
-                            <div>Net edge: {formatBps(row.suggestion.cost.netEdgePct)}</div>
-                            <div>Deviation: {formatBps(row.suggestion.deviationPct)}</div>
-                            <div>Spread: {formatBps(row.suggestion.cost.spreadPct)}</div>
-                            <div>Suggested notional: {roundTo(row.suggestion.suggestedNotional, 6)}</div>
-                            <div>Suggested qty: {roundTo(row.suggestion.suggestedQty, 8)}</div>
-                          </div>
-                          <button className="action-button" onClick={() => applyScannerPair(row.pair)}>
-                            Use this pair in Assistant
-                          </button>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <h2>My Live Position</h2>
-                <div className="grid-three">
-                  <div className="field">
-                    <span>Kraken authenticated</span>
-                    <strong>{positionsState?.authenticated ? "Yes" : "No"}</strong>
-                    <small>{positionsState?.lastError || "Read-only account monitor active."}</small>
-                  </div>
-                  <label className="field">
-                    <span>Manual fallback / override</span>
-                    <select value={manualOverride ? "manual" : "auto"} onChange={(event) => setManualOverride(event.target.value === "manual")}>
-                      <option value="auto">Auto detect</option>
-                      <option value="manual">Manual override</option>
-                    </select>
-                    <small>Use manual mode when keys are missing or detection is incomplete.</small>
-                  </label>
-                </div>
-
-                {manualOverride || !positionsState?.authenticated ? (
-                  <div className="grid-four">
-                    <label className="field">
-                      <span>Pair</span>
-                      <select value={manualPair} onChange={(event) => setManualPair(event.target.value)}>
-                        {selectedPairs.map((pair) => (
-                          <option key={pair} value={pair}>
-                            {formatPair(pair)}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="field">
-                      <span>Entry Price</span>
-                      <input type="text" inputMode="decimal" value={manualEntryPrice} onChange={(event) => setManualEntryPrice(event.target.value)} />
-                    </label>
-                    <label className="field">
-                      <span>Quantity</span>
-                      <input type="text" inputMode="decimal" value={manualQty} onChange={(event) => setManualQty(event.target.value)} />
-                    </label>
-                    <label className="field">
-                      <span>Opened At</span>
-                      <input type="datetime-local" value={manualOpenedAt} onChange={(event) => setManualOpenedAt(event.target.value)} />
-                    </label>
-                  </div>
-                ) : null}
-
-                <div className="grid-two">
-                  {monitoredPositions.length === 0 ? (
-                    <div className="warning">No live position detected. Place a manual trade on Kraken or enter manual position details.</div>
-                  ) : (
-                    monitoredPositions.map((position) => {
-                      const ticker = liveTickers[position.pair] ?? getMarketPair(position.pair)?.ticker ?? null;
-                      const tp = position.entryPrice * (1 + params.takeProfitPct);
-                      const sl = position.entryPrice * (1 - params.stopLossPct);
-                      const remainingMs = params.maxHoldMinutes * 60_000 - (Date.now() - Date.parse(position.openedAt));
-
-                      return (
-                        <article key={`${position.pair}-${position.openedAt}-${position.qty}`} className="panel">
-                          <div className="panel-inner">
-                            <div className="card-head">
-                              <h3>{formatPair(position.pair)}</h3>
-                              <span className="badge">{position.source}</span>
-                            </div>
-                            <div className="mini-grid mono">
-                              <div>qty: {position.qty}</div>
-                              <div>entry_price: {position.entryPrice}</div>
-                              <div>opened_at: {position.openedAt}</div>
-                              <div>tp_target: {roundTo(tp, 6)}</div>
-                              <div>sl_trigger: {roundTo(sl, 6)}</div>
-                              <div>time_remaining_min: {roundTo(Math.max(0, remainingMs) / 60_000, 2)}</div>
-                              <div>last_price: {ticker ? roundTo(ticker.last, 6) : "n/a"}</div>
-                              <div>spread: {ticker ? `${formatBps(ticker.spreadPct)} (${formatPctPrecise(ticker.spreadPct)})` : "n/a"}</div>
-                            </div>
-                          </div>
-                        </article>
-                      );
-                    })
-                  )}
-                </div>
-
-                <h3>Detected Open Orders</h3>
-                {positionsState?.openOrders.length ? (
-                  <ul className="flat-list mono">
-                    {positionsState.openOrders.map((order) => (
-                      <li key={order.orderId}>
-                        {formatPair(order.pair)} {order.side} {order.type} qty {roundTo(order.qty, 8)} @ {roundTo(order.price, 8)} ({order.openedAt})
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <div className="subtle">No open orders detected for selected pairs.</div>
-                )}
-              </div>
-            </section>
-
-            <section className="panel">
-              <div className="panel-inner">
-                <div className="card-head">
-                  <h2>Alerts</h2>
-                  <button className="action-button" onClick={() => setAlerts([])}>
-                    Clear Alerts
-                  </button>
-                </div>
-                {alerts.length === 0 ? (
-                  <div className="subtle">No alerts yet.</div>
-                ) : (
-                  <ul className="flat-list mono">
-                    {alerts.map((alert) => (
-                      <li key={alert.id}>
-                        [{alert.at}] {formatPair(alert.pair)} {alert.type}: {alert.message}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            </section>
+            </div>
+            {renderSuggestionModal()}
           </>
         ) : activeTab === "AUTOMATION" ? (
           <AutomationTab />
         ) : (
           <section className="panel">
-            <div className="panel-inner">
+            <div className="panel-inner text-reading">
               <h2>Glossary</h2>
-              <div className="subtle">Plain-language explanations for trading terms used across the Assistant.</div>
+              <div className="subtle text-reading">Plain-language explanations for trading terms used across the Assistant.</div>
               <div className="glossary-grid">
                 {glossaryTerms.map((term) => (
                   <article

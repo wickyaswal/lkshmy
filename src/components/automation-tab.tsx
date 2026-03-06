@@ -68,7 +68,7 @@ export function AutomationTab() {
     <section className="panel">
       <div className="panel-inner">
         <h2>Automation (Later phase)</h2>
-        <p>
+        <p className="text-reading">
           All legacy auto-trading features have been moved under this tab. In this manual-assistant phase, automation
           execution remains disabled.
         </p>
@@ -94,7 +94,7 @@ export function AutomationTab() {
                   Export Logs
                 </button>
               </div>
-              <div className="subtle">Execution is intentionally disabled until the automation phase is re-enabled.</div>
+              <div className="subtle text-reading">Execution is intentionally disabled until the automation phase is re-enabled.</div>
             </div>
           </article>
 
@@ -108,13 +108,13 @@ export function AutomationTab() {
                   </li>
                 ))}
               </ul>
-              <div className="subtle">Expected status during this phase: `410 Gone`.</div>
+              <div className="subtle text-reading">Expected status during this phase: `410 Gone`.</div>
             </div>
           </article>
         </div>
 
         <article className="panel">
-          <div className="panel-inner">
+          <div className="panel-inner text-reading">
             <h3>Moved Automation Scope</h3>
             <ul className="flat-list">
               <li>Runner scheduling and autonomous tick orchestration</li>

@@ -27,6 +27,27 @@ export type SuggestionCostBreakdown = {
   netEdgePct: number;
 };
 
+export type DeviationDirection = "BELOW_MA" | "ABOVE_MA" | "AT_MA";
+
+export type SuggestionSizingAudit = {
+  entryPrice: number;
+  targetNotionalRaw: number;
+  targetNotionalAfterCap: number;
+  qtyRaw: number;
+  qtyStep: number;
+  qtyFloored: number;
+  minOrderQty: number;
+  minNotional: number;
+  notional: number;
+  firstFailingRule: string | null;
+};
+
+export type SuggestionParameterSanity = {
+  maxPossibleNetEdgeNoSpreadPct: number;
+  minNetEdgePct: number;
+  viableUnreachable: boolean;
+};
+
 export type DeterministicSuggestion = {
   pair: string;
   decision: SuggestionDecision;
@@ -42,9 +63,17 @@ export type DeterministicSuggestion = {
   signalDetected: boolean;
   maValue: number | null;
   deviationPct: number;
+  deviationBps: number;
+  deviationDirection: DeviationDirection;
+  deviationText: string;
   reasons: string[];
   whyBullets: string[];
+  waitReasons: string[];
+  hardBlockingReasons: string[];
   blockingReasons: string[];
+  minOrderOk: boolean;
+  sizingAudit: SuggestionSizingAudit;
+  parameterSanity: SuggestionParameterSanity;
   buyChecklist: {
     netEdge: {
       met: boolean;

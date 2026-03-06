@@ -162,7 +162,7 @@ export function DashboardShell({ initialState }: { initialState: DashboardStateP
       <div className="page-frame">
         <section className="hero">
           <h1>Fiat Buffer Trading</h1>
-          <p>Live dashboard for capital, buffer, bot runtime status, and exchange/service connectivity.</p>
+          <p className="text-reading">Live dashboard for capital, buffer, bot runtime status, and exchange/service connectivity.</p>
           <div className="badge-row">
             <span className="badge">Updated: {state.updatedAt}</span>
             <span className="badge">Polling: {state.pollingIntervalSeconds}s</span>
@@ -174,7 +174,7 @@ export function DashboardShell({ initialState }: { initialState: DashboardStateP
 
         <div className={`status-banner ${state.status.lastError ? "error" : ""}`}>
           <strong>Bot Feedback</strong>
-          <div className="subtle">{feedback || "Dashboard is updating live."}</div>
+          <div className="subtle text-reading">{feedback || "Dashboard is updating live."}</div>
         </div>
 
         <section className="control-row">
@@ -199,7 +199,7 @@ export function DashboardShell({ initialState }: { initialState: DashboardStateP
           <article className="panel">
             <div className="panel-inner">
               <h3>Trading Capital (TC)</h3>
-              <div className="kpi-value mono">
+              <div className="kpi-value metric">
                 {state.tradingCapital.value ?? "n/a"} {state.tradingCapital.quoteCurrency}
               </div>
               <div className="subtle mono">Formula: {state.tradingCapital.formulaLabel}</div>
@@ -212,7 +212,7 @@ export function DashboardShell({ initialState }: { initialState: DashboardStateP
           <article className="panel">
             <div className="panel-inner">
               <h3>Buffer</h3>
-              <div className="kpi-value mono">
+              <div className="kpi-value metric">
                 {state.buffer.value} {state.tradingCapital.quoteCurrency}
               </div>
               <div className="subtle mono">

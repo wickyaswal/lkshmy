@@ -23,11 +23,12 @@ export type ScannerOpportunity = {
   pair: string;
   suggestion: DeterministicSuggestion;
   scoreScaled: number;
+  needsDip: boolean;
 };
 
 const SCORE_SCALE = 1_000_000_000;
-const RED_THRESHOLD = -0.01;
-const GREEN_THRESHOLD = 0.01;
+export const SENTIMENT_RED_THRESHOLD_PCT = -0.01;
+export const SENTIMENT_GREEN_THRESHOLD_PCT = 0.01;
 
 const toScaled = (value: number): number => Math.round(value * SCORE_SCALE);
 
@@ -63,11 +64,11 @@ const buildSentimentReferenceLabel = (inputs: SentimentInput[]): MarketSentiment
 };
 
 export const classifySentiment = (scorePct: number): SentimentClassification => {
-  if (scorePct <= RED_THRESHOLD) {
+  if (scorePct <= SENTIMENT_RED_THRESHOLD_PCT) {
     return "RISK_OFF";
   }
 
-  if (scorePct >= GREEN_THRESHOLD) {
+  if (scorePct >= SENTIMENT_GREEN_THRESHOLD_PCT) {
     return "RISK_ON";
   }
 
@@ -127,11 +128,37 @@ export const rankScannerOpportunities = (input: {
   suggestions: DeterministicSuggestion[];
   availableQuoteBalance: number;
   sentiment: SentimentClassification;
+  riskOffExtraStrict?: boolean;
   limit?: number;
 }): ScannerOpportunity[] => {
-  const safeLimit = Math.max(1, Math.min(10, Math.trunc(input.limit ?? 3)));
+  const candidateLists = buildDeterministicCandidateLists({
+    suggestions: input.suggestions,
+    availableQuoteBalance: input.availableQuoteBalance,
+    sentiment: input.sentiment,
+    riskOffExtraStrict: input.riskOffExtraStrict,
+    limit: input.limit
+  });
 
-  const candidates = input.suggestions.filter((suggestion) => {
+  return [...candidateLists.buyCandidates, ...candidateLists.watchCandidates].slice(
+    0,
+    Math.max(1, Math.min(10, Math.trunc(input.limit ?? 3)))
+  );
+};
+
+export const buildDeterministicCandidateLists = (input: {
+  suggestions: DeterministicSuggestion[];
+  availableQuoteBalance: number;
+  sentiment: SentimentClassification;
+  riskOffExtraStrict?: boolean;
+  limit?: number;
+}): {
+  buyCandidates: ScannerOpportunity[];
+  watchCandidates: ScannerOpportunity[];
+} => {
+  const safeLimit = Math.max(1, Math.min(10, Math.trunc(input.limit ?? 3)));
+  const strictRiskOff = input.riskOffExtraStrict === true && input.sentiment === "RISK_OFF";
+
+  const affordable = input.suggestions.filter((suggestion) => {
     if (!Number.isFinite(input.availableQuoteBalance) || input.availableQuoteBalance <= 0) {
       return false;
     }
@@ -144,34 +171,71 @@ export const rankScannerOpportunities = (input: {
       return false;
     }
 
-    if (suggestion.viability === "NOT_VIABLE") {
-      return false;
-    }
-
-    if (input.sentiment === "RISK_OFF" && suggestion.viability !== "VIABLE") {
-      return false;
-    }
-
     return true;
   });
 
-  const ranked = candidates
+  const rankWatchCandidate = (candidate: ScannerOpportunity, other: ScannerOpportunity): number => {
+    if (other.suggestion.cost.netEdgePct !== candidate.suggestion.cost.netEdgePct) {
+      return other.suggestion.cost.netEdgePct - candidate.suggestion.cost.netEdgePct;
+    }
+
+    if (candidate.suggestion.cost.spreadPct !== other.suggestion.cost.spreadPct) {
+      return candidate.suggestion.cost.spreadPct - other.suggestion.cost.spreadPct;
+    }
+
+    const candidateBelow = candidate.suggestion.deviationPct >= 0;
+    const otherBelow = other.suggestion.deviationPct >= 0;
+
+    if (candidateBelow !== otherBelow) {
+      return candidateBelow ? -1 : 1;
+    }
+
+    if (candidateBelow) {
+      if (other.suggestion.deviationPct !== candidate.suggestion.deviationPct) {
+        return other.suggestion.deviationPct - candidate.suggestion.deviationPct;
+      }
+    } else if (other.suggestion.deviationPct !== candidate.suggestion.deviationPct) {
+      return other.suggestion.deviationPct - candidate.suggestion.deviationPct;
+    }
+
+    return candidate.pair.localeCompare(other.pair);
+  };
+
+  const buyCandidates = affordable
+    .filter((suggestion) => suggestion.decision === "BUY")
     .map((suggestion) => ({
       pair: suggestion.pair,
       suggestion,
-      scoreScaled: toScaled(suggestion.cost.netEdgePct) + toScaled(suggestion.deviationPct)
+      scoreScaled: toScaled(suggestion.cost.netEdgePct) + toScaled(suggestion.deviationPct),
+      needsDip: false
     }))
     .sort((left, right) => {
-      if (right.scoreScaled !== left.scoreScaled) {
-        return right.scoreScaled - left.scoreScaled;
+      if (right.suggestion.cost.netEdgePct !== left.suggestion.cost.netEdgePct) {
+        return right.suggestion.cost.netEdgePct - left.suggestion.cost.netEdgePct;
       }
 
       if (left.suggestion.cost.spreadPct !== right.suggestion.cost.spreadPct) {
         return left.suggestion.cost.spreadPct - right.suggestion.cost.spreadPct;
       }
 
-      return left.pair.localeCompare(right.pair);
-    });
+      return right.suggestion.deviationPct - left.suggestion.deviationPct;
+    })
+    .slice(0, safeLimit);
 
-  return ranked.slice(0, safeLimit);
+  const watchCandidates = affordable
+    .filter((suggestion) => suggestion.decision === "WAIT" && suggestion.viability !== "NOT_VIABLE")
+    .filter((suggestion) => !strictRiskOff || suggestion.viability === "VIABLE")
+    .map((suggestion) => ({
+      pair: suggestion.pair,
+      suggestion,
+      scoreScaled: toScaled(suggestion.cost.netEdgePct) + toScaled(suggestion.deviationPct),
+      needsDip: suggestion.deviationPct < 0
+    }))
+    .sort(rankWatchCandidate)
+    .slice(0, safeLimit);
+
+  return {
+    buyCandidates,
+    watchCandidates
+  };
 };

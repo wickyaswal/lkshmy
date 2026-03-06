@@ -8,8 +8,10 @@ export const runtime = "nodejs";
 export async function GET(request: NextRequest) {
   try {
     const pairs = parseAssistantPairs(request.nextUrl.searchParams.get("pairs"), ["BTCUSDT"], 3);
+    const forceRefresh = request.nextUrl.searchParams.get("force_refresh") === "true";
     const payload = await getAssistantPositionsState({
-      pairs
+      pairs,
+      forceRefresh
     });
 
     return NextResponse.json({
