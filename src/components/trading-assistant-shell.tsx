@@ -1931,8 +1931,7 @@ export function TradingAssistantShell() {
             onChange={(event) => setAiQuestion(event.target.value)}
           />
         </label>
-        <div className="subtle text-reading">Use `Draft` or `Ask` from a suggestion row to turn that suggestion into a contextual Explain & Ask prompt.</div>
-
+  
         <div className="grid-three assistant-options">
           <label className="check-row">
             <input type="checkbox" checked={aiSimpleLanguage} onChange={(event) => setAiSimpleLanguage(event.target.checked)} />
