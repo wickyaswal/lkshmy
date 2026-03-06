@@ -8,9 +8,17 @@ import { AutomationTab } from "@/components/automation-tab";
 import {
   buildAccountSuggestionPairUniverse,
   buildBalanceSuggestions,
+  type AccountSuggestionStatus,
   type BalanceSuggestion,
   type KrakenOrderTemplateType
 } from "@/lib/assistant/account-suggestions";
+import {
+  buildSuggestionAlertId,
+  createSuggestionAlertSuppressionRecord,
+  isSuggestionAlertSuppressionRecord,
+  mergeSuggestionAlertSuppressions,
+  type SuggestionAlertSuppressionRecord
+} from "@/lib/assistant/suggestion-alerts";
 import type { AiSnapshot } from "@/lib/assistant/ai/types";
 import {
   computeMarketSentiment,
@@ -132,6 +140,11 @@ type AiApiPayload = {
   message?: string;
 };
 
+type SuggestionAlertsApiPayload = {
+  suppressions?: SuggestionAlertSuppressionRecord[];
+  message?: string;
+};
+
 type DiagnosticEntry = {
   id: string;
   scope: "Account" | "Suggestions" | "Sentiment" | "Assistant";
@@ -141,8 +154,12 @@ type DiagnosticEntry = {
 
 type AccountSectionKey = "openOrders" | "latestActivity";
 type PanelSectionKey = "balances" | "account" | "suggestions" | "assistant" | "sentiment" | "advancedStrategy";
+type BrowserNotificationPermission = NotificationPermission | "unsupported" | "unknown";
 const fallbackExampleEntry = 71_429;
 const SENTIMENT_TOOLTIP_ID = "assistant-sentiment-tooltip";
+const SUGGESTION_ACTION_TOOLTIP_ID = "assistant-suggestion-action-tooltip";
+const SUGGESTION_STATUS_TOOLTIP_ID = "assistant-suggestion-status-tooltip";
+const SUGGESTION_SUPPRESSIONS_LOCAL_STORAGE_KEY = "assistant:ignored-ready-suggestions";
 const GLOSSARY_ORDER: GlossaryTermId[] = [
   "spread",
   "mid",
@@ -251,6 +268,27 @@ const formatShortDateTime = (value: string): string => {
   return new Date(time).toLocaleString();
 };
 const formatPanelStatusLabel = (open: boolean): string => (open ? "Collapse" : "Expand");
+const loadSuggestionSuppressionsFromLocalStorage = (): SuggestionAlertSuppressionRecord[] => {
+  if (typeof window === "undefined") {
+    return [];
+  }
+
+  try {
+    const raw = window.localStorage.getItem(SUGGESTION_SUPPRESSIONS_LOCAL_STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    return mergeSuggestionAlertSuppressions(parsed.filter(isSuggestionAlertSuppressionRecord));
+  } catch {
+    return [];
+  }
+};
 const buildKrakenMarketUrl = (pair: string | null): string | null => {
   if (!pair) {
     return null;
@@ -613,6 +651,53 @@ const buildTooltipHtml = (title: string, lines: string[]): string => {
   return [`<strong>${escapedTitle}</strong>`, ...escapedLines].join("<br/>");
 };
 
+const suggestionActionTooltipHtml = (side: BalanceSuggestion["side"]): string =>
+  buildTooltipHtml(side === "BUY" ? "BUY suggestion" : "SELL suggestion", side === "BUY"
+    ? [
+      "BUY means this row is proposing a manual buy setup.",
+      "It uses your quote balance, such as EUR, USD, or USDT, to accumulate the base asset in the listed pair.",
+      "Open the Kraken form or ask Explain & Ask if you want help interpreting the numbers before copying anything."
+    ]
+    : [
+      "SELL means this row is proposing a manual sell or protective exit setup.",
+      "It uses an asset you already hold, such as XRP or ADA, and builds a sell-side Kraken form for that balance.",
+      "The suggestion may be a profit-taking, protective, or trailing exit depending on the row template."
+    ]);
+
+const suggestionStatusTooltipHtml = (status: AccountSuggestionStatus): string => {
+  switch (status) {
+    case "READY":
+      return buildTooltipHtml("READY", [
+        "READY means this suggestion is actionable enough to copy into Kraken now.",
+        "The row has a usable market pair and order template, and the current conditions are strong enough for immediate review."
+      ]);
+    case "WATCH":
+      return buildTooltipHtml("WATCH", [
+        "WATCH means this suggestion is worth monitoring, but not strong or clear enough to copy right now.",
+        "Usually the balance is usable, but price conditions or deterministic quality checks are not fully aligned yet."
+      ]);
+    case "NO_ACTION":
+      return buildTooltipHtml("NO ACTION", [
+        "NO ACTION means this row is blocked or unsupported right now.",
+        "Common reasons are missing market support, failed size constraints, or no safe deterministic template to copy."
+      ]);
+    default:
+      return buildTooltipHtml("Status", ["Suggestion status explanation."]);
+  }
+};
+
+const suggestionActionColumnTooltipHtml = buildTooltipHtml("Action column", [
+  "BUY rows use a quote balance to build a manual entry idea.",
+  "SELL rows use an existing asset balance to build a manual exit or protection idea.",
+  "This tells you what side of the market the suggestion is about."
+]);
+
+const suggestionStatusColumnTooltipHtml = buildTooltipHtml("Status column", [
+  "READY: actionable enough to review and copy now.",
+  "WATCH: monitor it, but do not treat it as ready yet.",
+  "NO ACTION: blocked or not supported right now."
+]);
+
 function TooltipInfoButton(input: { tooltipKey: TooltipKey; params: StrategyParams; referencePrice: number | null }) {
   const copy = tooltipText(input.tooltipKey, input.params, input.referencePrice);
   const tooltipId = tooltipIdFor(input.tooltipKey);
@@ -685,6 +770,8 @@ export function TradingAssistantShell() {
   const [aiSnapshotPayload, setAiSnapshotPayload] = useState<AiSnapshot | null>(null);
   const [showAiSnapshot, setShowAiSnapshot] = useState(false);
   const [aiCooldownUntilMs, setAiCooldownUntilMs] = useState(0);
+  const [notificationPermission, setNotificationPermission] = useState<BrowserNotificationPermission>("unknown");
+  const [suppressedSuggestionRecords, setSuppressedSuggestionRecords] = useState<SuggestionAlertSuppressionRecord[]>([]);
   const [advancedStrategyOpen, setAdvancedStrategyOpen] = useState(false);
   const [panelOpen, setPanelOpen] = useState<Record<PanelSectionKey, boolean>>({
     balances: true,
@@ -708,6 +795,7 @@ export function TradingAssistantShell() {
   const [activeSuggestionOrderType, setActiveSuggestionOrderType] = useState<KrakenOrderTemplateType | null>(null);
   const [copiedSuggestionFieldKey, setCopiedSuggestionFieldKey] = useState<string | null>(null);
   const diagnosticsLastSeenRef = useRef(new Map<string, number>());
+  const notifiedSuggestionIdsRef = useRef(new Set<string>());
   const glossaryRefs = useRef<Partial<Record<GlossaryTermId, HTMLElement | null>>>({});
   const wsSymbolsRef = useRef<Record<string, string>>({});
   const assistantPanelRef = useRef<HTMLElement | null>(null);
@@ -775,6 +863,71 @@ export function TradingAssistantShell() {
   useEffect(() => {
     window.localStorage.setItem("assistant:advanced-strategy-open", advancedStrategyOpen ? "true" : "false");
   }, [advancedStrategyOpen]);
+
+  useEffect(() => {
+    setSuppressedSuggestionRecords(loadSuggestionSuppressionsFromLocalStorage());
+
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      return;
+    }
+
+    setNotificationPermission(window.Notification.permission);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    window.localStorage.setItem(
+      SUGGESTION_SUPPRESSIONS_LOCAL_STORAGE_KEY,
+      JSON.stringify(mergeSuggestionAlertSuppressions(suppressedSuggestionRecords))
+    );
+  }, [suppressedSuggestionRecords]);
+
+  useEffect(() => {
+    let active = true;
+
+    const fetchSuggestionSuppressions = async () => {
+      try {
+        const response = await fetch("/api/assistant/suggestion-alerts", {
+          cache: "no-store"
+        });
+
+        if (response.status === 401) {
+          redirectToLogin();
+          return;
+        }
+
+        const payload = await parseJson<SuggestionAlertsApiPayload>(response);
+        if (!response.ok) {
+          throw new Error(payload.message ?? "Unable to load ignored suggestion notifications.");
+        }
+
+        if (!active) {
+          return;
+        }
+
+        setSuppressedSuggestionRecords((current) =>
+          mergeSuggestionAlertSuppressions([...(payload.suppressions ?? []), ...current])
+        );
+      } catch (error) {
+        if (!active) {
+          return;
+        }
+
+        const message = error instanceof Error ? error.message : "Unable to load ignored suggestion notifications.";
+        pushDiagnostic("Suggestions", message);
+      }
+    };
+
+    void fetchSuggestionSuppressions();
+
+    return () => {
+      active = false;
+    };
+  }, [pushDiagnostic, redirectToLogin]);
 
   useEffect(() => {
     Modal.setAppElement("body");
@@ -1131,6 +1284,10 @@ export function TradingAssistantShell() {
       }),
     [positionsState, accountSuggestionMarketState, params, selectedPairs, sentiment.classification]
   );
+  const suppressedSuggestionIds = useMemo(
+    () => new Set(suppressedSuggestionRecords.map((record) => record.id)),
+    [suppressedSuggestionRecords]
+  );
   const activeBalanceSuggestion = useMemo(
     () => balanceSuggestions.find((row) => row.key === activeSuggestionKey) ?? null,
     [balanceSuggestions, activeSuggestionKey]
@@ -1178,6 +1335,47 @@ export function TradingAssistantShell() {
       pushDiagnostic("Account", positionsState.lastError);
     }
   }, [positionsState, pushDiagnostic]);
+
+  useEffect(() => {
+    if (notificationPermission !== "granted" || typeof window === "undefined" || !("Notification" in window)) {
+      return;
+    }
+
+    const currentReadyIds = new Set(
+      balanceSuggestions
+        .filter((suggestion) => suggestion.status === "READY")
+        .map((suggestion) => buildSuggestionAlertId(suggestion))
+    );
+
+    for (const existingId of Array.from(notifiedSuggestionIdsRef.current)) {
+      if (!currentReadyIds.has(existingId)) {
+        notifiedSuggestionIdsRef.current.delete(existingId);
+      }
+    }
+
+    for (const suggestion of balanceSuggestions) {
+      if (suggestion.status !== "READY") {
+        continue;
+      }
+
+      const alertId = buildSuggestionAlertId(suggestion);
+      if (suppressedSuggestionIds.has(alertId) || notifiedSuggestionIdsRef.current.has(alertId)) {
+        continue;
+      }
+
+      const title = `${suggestion.side === "BUY" ? "Ready to review a buy" : "Ready to review a sell"}: ${suggestion.marketPair ? formatPair(suggestion.marketPair) : suggestion.asset}`;
+      const notification = new window.Notification(title, {
+        body: `${suggestion.headline} ${suggestion.summary}`,
+        tag: alertId
+      });
+
+      notification.onclick = () => {
+        window.focus();
+      };
+
+      notifiedSuggestionIdsRef.current.add(alertId);
+    }
+  }, [balanceSuggestions, notificationPermission, suppressedSuggestionIds]);
 
   useEffect(() => {
     if (!activeSuggestionKey) {
@@ -1252,6 +1450,87 @@ export function TradingAssistantShell() {
       setFeedback("Account refresh failed. See Diagnostics.");
     }
     setRefreshingAccountSnapshot(false);
+  };
+
+  const requestBrowserNotifications = async () => {
+    if (typeof window === "undefined" || !("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      setFeedback("Browser notifications are not supported in this browser.");
+      return;
+    }
+
+    try {
+      const permission = await window.Notification.requestPermission();
+      setNotificationPermission(permission);
+      setFeedback(
+        permission === "granted"
+          ? "Browser notifications enabled for READY suggestions."
+          : permission === "denied"
+            ? "Browser notifications are blocked by the browser."
+            : "Browser notifications were not enabled."
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not request browser notifications.";
+      pushDiagnostic("Suggestions", message);
+      setFeedback("Could not enable browser notifications. See Diagnostics.");
+    }
+  };
+
+  const setSuggestionSuppressed = async (suggestion: BalanceSuggestion, suppressed: boolean) => {
+    const record = createSuggestionAlertSuppressionRecord(suggestion);
+
+    setSuppressedSuggestionRecords((current) =>
+      suppressed
+        ? mergeSuggestionAlertSuppressions([...current, record])
+        : current.filter((entry) => entry.id !== record.id)
+    );
+
+    setFeedback(
+      suppressed
+        ? `Ignored READY notifications for ${suggestion.marketPair ? formatPair(suggestion.marketPair) : suggestion.asset}.`
+        : `Restored READY notifications for ${suggestion.marketPair ? formatPair(suggestion.marketPair) : suggestion.asset}.`
+    );
+
+    try {
+      const response = await fetch("/api/assistant/suggestion-alerts", {
+        method: "POST",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(
+          suppressed
+            ? {
+              action: "suppress",
+              record
+            }
+            : {
+              action: "unsuppress",
+              id: record.id
+            }
+        )
+      });
+
+      if (response.status === 401) {
+        redirectToLogin();
+        return;
+      }
+
+      const payload = await parseJson<SuggestionAlertsApiPayload>(response);
+      if (!response.ok) {
+        throw new Error(payload.message ?? "Could not persist suggestion notification preferences.");
+      }
+
+      setSuppressedSuggestionRecords(payload.suppressions ?? []);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not persist suggestion notification preferences.";
+      pushDiagnostic("Suggestions", `${message} Local browser suppression still applied.`);
+      setFeedback(
+        suppressed
+          ? "Ignored locally in this browser. Markdown persistence was unavailable."
+          : "Restored locally in this browser. Markdown persistence was unavailable."
+      );
+    }
   };
 
   const togglePanel = (key: PanelSectionKey) => {
@@ -1607,6 +1886,17 @@ export function TradingAssistantShell() {
           <h2>Suggestions</h2>
           <div className="card-head-actions">
             {suggestionsHasIssue ? <span className="badge alert compact-chip">Data issue</span> : null}
+            {notificationPermission === "granted" ? (
+              <span className="badge success compact-chip">Notifications on</span>
+            ) : notificationPermission === "denied" ? (
+              <span className="badge muted compact-chip">Notifications blocked</span>
+            ) : notificationPermission === "default" ? (
+              <button className="action-button compact" onClick={() => void requestBrowserNotifications()}>
+                Enable Notifications
+              </button>
+            ) : notificationPermission === "unsupported" ? (
+              <span className="badge muted compact-chip">Notifications unavailable</span>
+            ) : null}
             <button className="action-button compact" onClick={() => togglePanel("suggestions")}>
               {formatPanelStatusLabel(panelOpen.suggestions)}
             </button>
@@ -1615,6 +1905,9 @@ export function TradingAssistantShell() {
         {panelOpen.suggestions ? (
         <>
         <div className="subtle text-reading">{feedback}</div>
+        <div className="subtle text-reading">
+          READY suggestions can trigger a browser notification. Use Ignore to suppress one specific ready setup and save that preference locally.
+        </div>
         {netEdgeSanity.viableUnreachable ? (
           <div className="warning text-reading">
             Your min net edge is unreachable unless spread is near 0. Max possible edge without spread is {formatBps(netEdgeSanity.maxPossibleNetEdgeNoSpreadPct)}
@@ -1631,8 +1924,36 @@ export function TradingAssistantShell() {
                   <th>Asset</th>
                   <th>Available</th>
                   <th>Pair</th>
-                  <th>Action</th>
-                  <th>Status</th>
+                  <th>
+                    <span className="table-head-with-help">
+                      <span>Action</span>
+                      <button
+                        type="button"
+                        className="info-button table-help-button"
+                        data-tooltip-id={SUGGESTION_ACTION_TOOLTIP_ID}
+                        data-tooltip-html={suggestionActionColumnTooltipHtml}
+                        aria-label="Action column explanation"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        i
+                      </button>
+                    </span>
+                  </th>
+                  <th>
+                    <span className="table-head-with-help">
+                      <span>Status</span>
+                      <button
+                        type="button"
+                        className="info-button table-help-button"
+                        data-tooltip-id={SUGGESTION_STATUS_TOOLTIP_ID}
+                        data-tooltip-html={suggestionStatusColumnTooltipHtml}
+                        aria-label="Status column explanation"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        i
+                      </button>
+                    </span>
+                  </th>
                   <th>Explain</th>
                   <th>Kraken</th>
                   <th>Snapshot</th>
@@ -1644,87 +1965,119 @@ export function TradingAssistantShell() {
                 </tr>
               </thead>
               <tbody>
-                {balanceSuggestions.map((row) => (
-                  <tr
-                    key={row.key}
-                    className={`interactive-row suggestion-row ${row.side.toLowerCase()}`}
-                    onClick={() => openSuggestionModal(row)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault();
-                        openSuggestionModal(row);
-                      }
-                    }}
-                    role="button"
-                    tabIndex={0}
-                  >
-                    <td className="suggestion-asset-cell">{row.asset}</td>
-                    <td className="numeric-cell">{formatDisplayAvailable(row.available)}</td>
-                    <td className="pair-cell">{row.marketPair ? formatPair(row.marketPair) : "n/a"}</td>
-                    <td>
-                      <span className={`badge compact-chip suggestion-side ${row.side.toLowerCase()}`}>
-                        {row.side}
-                      </span>
-                    </td>
-                    <td>
-                      <span className={`badge compact-chip suggestion-status ${row.status.toLowerCase()}`}>{row.status.replace("_", " ")}</span>
-                    </td>
-                    <td>
-                      <div className="table-action-stack suggestion-actions-cell">
-                        <button
-                          type="button"
-                          className="action-button compact"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            draftSuggestionQuestion(row);
-                          }}
+                {balanceSuggestions.map((row) => {
+                  const suggestionAlertId = buildSuggestionAlertId(row);
+                  const isSuppressed = suppressedSuggestionIds.has(suggestionAlertId);
+
+                  return (
+                    <tr
+                      key={row.key}
+                      className={`interactive-row suggestion-row ${row.side.toLowerCase()}`}
+                      onClick={() => openSuggestionModal(row)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          openSuggestionModal(row);
+                        }
+                      }}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      <td className="suggestion-asset-cell">{row.asset}</td>
+                      <td className="numeric-cell">{formatDisplayAvailable(row.available)}</td>
+                      <td className="pair-cell">{row.marketPair ? formatPair(row.marketPair) : "n/a"}</td>
+                      <td>
+                        <span
+                          className={`badge compact-chip suggestion-side ${row.side.toLowerCase()}`}
+                          data-tooltip-id={SUGGESTION_ACTION_TOOLTIP_ID}
+                          data-tooltip-html={suggestionActionTooltipHtml(row.side)}
                         >
-                          Draft
-                        </button>
-                        <button
-                          type="button"
-                          className="action-button compact"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            void askAboutSuggestion(row);
-                          }}
-                        >
-                          Ask
-                        </button>
-                      </div>
-                    </td>
-                    <td>
-                      {buildKrakenMarketUrl(row.marketPair) ? (
-                        <a
-                          className="action-button compact table-link-button suggestion-open-button"
-                          href={buildKrakenMarketUrl(row.marketPair) ?? "#"}
-                          target="_blank"
-                          rel="noreferrer"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                          }}
-                        >
-                          Open
-                        </a>
-                      ) : (
-                        <span className="subtle">n/a</span>
-                      )}
-                    </td>
-                    <td className="snapshot-cell">
-                      <div className="suggestion-summary-cell">
-                        <strong>{row.headline}</strong>
-                        <span>{row.summary}</span>
-                      </div>
-                    </td>
-                    <td>{row.primaryOrderType ? formatOrderTypeLabel(row.primaryOrderType) : "n/a"}</td>
-                    <td className="numeric-cell">{row.quantity > 0 ? formatDisplayQty(row.quantity) : "n/a"}</td>
-                    <td className="numeric-cell">{formatDisplayPrice(row.price)}</td>
-                    <td className="numeric-cell">{formatDisplayPrice(row.triggerPrice)}</td>
-                    <td className="numeric-cell">{row.total > 0 ? formatDisplayPrice(row.total) : "n/a"}</td>
-                  </tr>
-                ))}
+                          {row.side}
+                        </span>
+                      </td>
+                      <td>
+                        <div className="suggestion-status-cell">
+                          <span
+                            className={`badge compact-chip suggestion-status ${row.status.toLowerCase()}`}
+                            data-tooltip-id={SUGGESTION_STATUS_TOOLTIP_ID}
+                            data-tooltip-html={suggestionStatusTooltipHtml(row.status)}
+                          >
+                            {row.status.replace("_", " ")}
+                          </span>
+                          {isSuppressed ? <span className="badge muted compact-chip">Ignored</span> : null}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="table-action-stack suggestion-actions-cell">
+                          <button
+                            type="button"
+                            className="action-button compact"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              draftSuggestionQuestion(row);
+                            }}
+                          >
+                            Draft
+                          </button>
+                          <button
+                            type="button"
+                            className="action-button compact"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void askAboutSuggestion(row);
+                            }}
+                          >
+                            Ask
+                          </button>
+                          {row.status === "READY" ? (
+                            <button
+                              type="button"
+                              className={`action-button compact ${isSuppressed ? "secondary" : "danger"}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                void setSuggestionSuppressed(row, !isSuppressed);
+                              }}
+                            >
+                              {isSuppressed ? "Unignore" : "Ignore"}
+                            </button>
+                          ) : null}
+                        </div>
+                      </td>
+                      <td>
+                        {buildKrakenMarketUrl(row.marketPair) ? (
+                          <a
+                            className="action-button compact table-link-button suggestion-open-button"
+                            href={buildKrakenMarketUrl(row.marketPair) ?? "#"}
+                            target="_blank"
+                            rel="noreferrer"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                            }}
+                          >
+                            Open
+                          </a>
+                        ) : (
+                          <span className="subtle">n/a</span>
+                        )}
+                      </td>
+                      <td className="snapshot-cell">
+                        <div className="suggestion-summary-cell">
+                          <strong>{row.headline}</strong>
+                          <span>{row.summary}</span>
+                        </div>
+                      </td>
+                      <td>{row.primaryOrderType ? formatOrderTypeLabel(row.primaryOrderType) : "n/a"}</td>
+                      <td className="numeric-cell">{row.quantity > 0 ? formatDisplayQty(row.quantity) : "n/a"}</td>
+                      <td className="numeric-cell">{formatDisplayPrice(row.price)}</td>
+                      <td className="numeric-cell">{formatDisplayPrice(row.triggerPrice)}</td>
+                      <td className="numeric-cell">{row.total > 0 ? formatDisplayPrice(row.total) : "n/a"}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
+            <Tooltip id={SUGGESTION_ACTION_TOOLTIP_ID} className="assistant-tooltip" place="top" />
+            <Tooltip id={SUGGESTION_STATUS_TOOLTIP_ID} className="assistant-tooltip" place="top" />
           </div>
         )}
         </>
@@ -2190,12 +2543,12 @@ export function TradingAssistantShell() {
             <div className="assistant-header-grid">
               <div className="assistant-top-stack">
                 {renderBalancesPanel()}
-                {renderSuggestionsPanel()}
               </div>
               <div className="assistant-top-right">
                 {renderSentimentPanel()}
               </div>
             </div>
+            {renderSuggestionsPanel()}
             <div className="assistant-layout-grid">
               <div className="assistant-main-column">
                 {renderAssistantPanel()}

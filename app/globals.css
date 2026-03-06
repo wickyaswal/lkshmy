@@ -285,6 +285,18 @@ h4 {
   color: var(--danger);
 }
 
+.badge.success {
+  background: rgba(15, 123, 70, 0.1);
+  border-color: rgba(15, 123, 70, 0.18);
+  color: #0d663a;
+}
+
+.badge.muted {
+  background: rgba(81, 101, 88, 0.08);
+  border-color: rgba(81, 101, 88, 0.16);
+  color: var(--muted);
+}
+
 .stat-grid {
   display: grid;
   gap: 12px;
@@ -638,6 +650,18 @@ h4 {
   white-space: nowrap;
 }
 
+.table-head-with-help {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.table-help-button {
+  width: 18px;
+  height: 18px;
+  font-size: 0.68rem;
+}
+
 .suggestions-table .action-button.compact {
   min-width: 64px;
   padding: 6px 8px;
@@ -690,7 +714,7 @@ h4 {
 }
 
 .suggestion-actions-cell {
-  min-width: 68px;
+  min-width: 84px;
 }
 
 .suggestion-open-button {
@@ -727,7 +751,13 @@ h4 {
 .table-action-stack {
   display: grid;
   gap: 6px;
-  min-width: 68px;
+  min-width: 84px;
+}
+
+.suggestion-status-cell {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
 }
 
 .ai-placeholder {

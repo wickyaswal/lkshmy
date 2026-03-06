@@ -59,9 +59,13 @@ Top row:
 
 - left column:
   - `Balances`
-  - `Suggestions`
 - right column:
   - `Sentiment`
+
+Below the top row:
+
+- full width:
+  - `Suggestions`
 
 Below that:
 
@@ -124,7 +128,15 @@ Suggestion actions:
 
 - `Draft`: prefills a question into `Explain & Ask`
 - `Ask`: prefills and immediately sends that question
+- `Ignore`: suppresses browser notifications for that exact ready suggestion fingerprint
 - `Open`: opens the relevant Kraken market
+
+READY notifications:
+
+- when a suggestion reaches `READY`, the browser can notify you after permission is granted
+- notifications are sent once per suggestion fingerprint so the same ready setup does not spam repeatedly
+- `Ignore` stores that suppression locally and also attempts to persist it into `data/ignored-ready-suggestions.md`
+- if the app is running on a read-only filesystem, browser local storage still keeps the suppression for that browser
 
 Clicking a suggestion row opens a Kraken-style modal copy form.
 
