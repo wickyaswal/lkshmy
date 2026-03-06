@@ -1614,8 +1614,6 @@ export function TradingAssistantShell() {
         </div>
         {panelOpen.suggestions ? (
         <>
-        <div className="subtle text-reading">One row per live balance. Click a row to open the Kraken copy form.</div>
-        <div className="subtle text-reading">Available is your current balance. Order Qty is the amount this suggestion would use in the proposed order.</div>
         <div className="subtle text-reading">{feedback}</div>
         {netEdgeSanity.viableUnreachable ? (
           <div className="warning text-reading">
