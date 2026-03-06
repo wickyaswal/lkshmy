@@ -4,6 +4,7 @@ import { callOpenAiAssistant } from "@/lib/assistant/ai/openai-client";
 import { enforceViableMessaging, buildFallbackAiResponse, normalizeModelResponse } from "@/lib/assistant/ai/response-builder";
 import { aiAssistantRequestSchema, aiAssistantResponseSchema } from "@/lib/assistant/ai/schema";
 import { buildAiSnapshot } from "@/lib/assistant/ai/snapshot-builder";
+import { requireAuthenticatedApiRequest } from "@/lib/auth/guard";
 import { getEnv } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
@@ -66,6 +67,12 @@ const parseModelJson = (rawText: string): unknown => {
 };
 
 export async function POST(request: NextRequest) {
+  const authError = await requireAuthenticatedApiRequest(request);
+
+  if (authError) {
+    return authError;
+  }
+
   const key = getClientKey(request);
   const rate = checkRateLimit(key);
   if (!rate.allowed) {

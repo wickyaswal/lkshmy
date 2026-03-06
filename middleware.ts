@@ -3,7 +3,6 @@ import { NextResponse } from "next/server";
 
 import {
   APP_AUTH_COOKIE_NAME,
-  hasValidSessionCookie,
   sanitizeNextPath
 } from "@/lib/auth/session";
 
@@ -22,20 +21,12 @@ export async function middleware(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
 
   if (isStaticAsset(pathname) || PUBLIC_PATHS.has(pathname)) {
-    if (pathname === "/login") {
-      const isAuthenticated = await hasValidSessionCookie(request.cookies.get(APP_AUTH_COOKIE_NAME)?.value);
-
-      if (isAuthenticated) {
-        return NextResponse.redirect(new URL("/", request.url));
-      }
-    }
-
     return NextResponse.next();
   }
 
-  const isAuthenticated = await hasValidSessionCookie(request.cookies.get(APP_AUTH_COOKIE_NAME)?.value);
+  const hasSessionCookie = Boolean(request.cookies.get(APP_AUTH_COOKIE_NAME)?.value);
 
-  if (isAuthenticated) {
+  if (hasSessionCookie) {
     return NextResponse.next();
   }
 

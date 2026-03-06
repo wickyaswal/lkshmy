@@ -1,4 +1,12 @@
-import { isPasswordProtectionConfigured, sanitizeNextPath } from "@/lib/auth/session";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+
+import {
+  APP_AUTH_COOKIE_NAME,
+  hasValidSessionCookie,
+  isPasswordProtectionConfigured,
+  sanitizeNextPath
+} from "@/lib/auth/session";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -28,8 +36,15 @@ export default async function LoginPage(input: {
   searchParams?: Promise<SearchParams>;
 }) {
   const searchParams: SearchParams = (await input.searchParams) ?? {};
-  const passwordConfigured = isPasswordProtectionConfigured();
+  const cookieStore = await cookies();
+  const isAuthenticated = await hasValidSessionCookie(cookieStore.get(APP_AUTH_COOKIE_NAME)?.value);
   const nextPath = sanitizeNextPath(readString(searchParams.next));
+
+  if (isAuthenticated) {
+    redirect(nextPath);
+  }
+
+  const passwordConfigured = isPasswordProtectionConfigured();
   const errorMessage = getErrorMessage(readString(searchParams.error), passwordConfigured);
 
   return (

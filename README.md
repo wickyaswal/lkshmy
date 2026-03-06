@@ -45,6 +45,7 @@ Implementation details:
 - password is read from `APP_PASSWORD`
 - successful login sets a long-lived HTTP-only cookie
 - the session remains valid until the cookie is cleared or `APP_PASSWORD` changes
+- authentication is enforced both by middleware and by server-side page/API checks
 - if the cookie is missing or invalid, page requests redirect to `/login`
 - unauthorized API requests return `401`
 
@@ -329,6 +330,7 @@ Recommended setup:
 Important caveat:
 
 - the current assistant works on Vercel
+- the auth flow is enforced server-side as well as in middleware so Vercel edge/runtime differences do not bypass the password gate
 - long-running automation, background runners, or durable in-memory queues should not be hosted on Vercel serverless functions
 
 That limitation matters for the legacy automation layer, not for the current read-only assistant workflow.
