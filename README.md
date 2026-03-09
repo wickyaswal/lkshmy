@@ -1,106 +1,82 @@
 # Fiat Buffer Trading Assistant
 
-This repository is an existing Next.js + TypeScript crypto assistant focused on read-only Kraken workflows.
+This project is a private, password-protected crypto assistant built around a manual Kraken workflow.
 
-The current phase is manual-assistant only:
+Its purpose is simple:
 
-- no auto-trading
+- show your Kraken balances, open orders, and latest activity in one place
+- turn live balances into practical manual buy or sell suggestions
+- help you understand those suggestions before you copy anything into Kraken
+- keep trading support read-only and non-automated
+
+The current product is an assistant, not a bot.
+
 - no order placement
 - no order cancellation
-- no Google Sheets usage in the active workflow
-- AI is advisory only
+- no live auto-trading
+- no Google Sheets in the active workflow
+- AI is advisory only and does not override deterministic suggestions
 
-## What the app does now
+## Current product scope
 
-The `Assistant` tab is the active product surface.
-
-It helps with:
-
-- reading Kraken balances, open orders, and latest account activity
-- generating deterministic balance-driven suggestions
-- opening Kraken-ready copy forms for those suggestions
-- asking contextual questions in the `Explain & Ask` panel
-- viewing glossary explanations for trading concepts and order types
-
-Top navigation stays:
+The active navigation is:
 
 - `Assistant`
 - `System Automation`
 - `Glossary`
 
-`System Automation` is a placeholder. Legacy `/api/bot/*` routes still exist and return `410 Gone`.
+What these tabs mean:
 
-## Password protection
+- `Assistant`: the live product surface you use today
+- `System Automation`: placeholder area for later phases
+- `Glossary`: plain-language explanations of trading terms and order types
 
-The whole app is password protected.
+Legacy `/api/bot/*` routes still exist in the repository for compatibility, but they return `410 Gone` in this manual-assistant phase.
 
-Protection applies to:
+## What the Assistant does
 
-- the page itself
-- the Assistant UI
-- the API routes used by the app
+The `Assistant` tab is designed around a practical review flow:
 
-Implementation details:
+1. See what is currently in your account.
+2. See which balances might be worth acting on.
+3. Open a Kraken-style copy form for those suggestions.
+4. Ask follow-up questions in `Explain & Ask`.
 
-- password is read from `APP_PASSWORD`
-- successful login sets a long-lived HTTP-only cookie
-- the session remains valid until the cookie is cleared or `APP_PASSWORD` changes
-- authentication is enforced both by middleware and by server-side page/API checks
-- if the cookie is missing or invalid, page requests redirect to `/login`
-- unauthorized API requests return `401`
+The page is currently organized like this:
 
-There is no separate user system in this phase. This is one shared application password.
-
-## Current Assistant layout
-
-The `Assistant` tab is now organized like this:
-
-Top row:
-
-- left column:
+- top row:
   - `Balances`
-- right column:
   - `Sentiment`
-
-Below the top row:
-
-- full width:
-  - `Suggestions`
-
-Below that:
-
-- Kraken subtab row with:
-  - `Kraken`
-  - `Refresh Kraken`
-
-Lower layout:
-
-- main column:
+- below that:
+  - `Suggestions` (full width)
+- lower area:
   - `Explain & Ask`
-- right sidebar:
   - `Account`
   - `Advanced Strategy`
   - `Diagnostics`
 
-## Balances
+## Main features
 
-`Balances` is a dedicated top-level panel.
+### Balances
 
-It shows:
+Shows:
 
 - positive Kraken balances
-- asset
+- asset symbol
 - available amount
-- cache/live state
+- whether the last response came from cache or live fetch
 - last checked time
 
-## Suggestions
+### Suggestions
 
-`Suggestions` is balance-driven and deterministic.
+`Suggestions` is the core workflow.
 
-Each row represents one positive balance and tries to turn it into a practical Kraken-oriented idea.
+Each row starts from a live balance and turns it into a practical manual suggestion. That suggestion can be:
 
-Current front-of-table order:
+- a buy idea using a quote balance such as EUR, USD, or USDT
+- a sell or protective exit idea using an asset you already hold
+
+Front-of-table column order:
 
 1. `Asset`
 2. `Available`
@@ -111,7 +87,7 @@ Current front-of-table order:
 7. `Kraken`
 8. `Snapshot`
 
-The remaining execution fields follow after that:
+Additional execution detail columns follow after that:
 
 - `Primary Order`
 - `Order Qty`
@@ -119,28 +95,21 @@ The remaining execution fields follow after that:
 - `Trigger`
 - `Est. Total`
 
-Meaning of the two similar amount fields:
+Important distinction:
 
-- `Available`: the balance you currently hold in Kraken for that asset
-- `Order Qty`: the amount this specific suggested order would use
+- `Available` = what is currently in your Kraken account
+- `Order Qty` = how much this specific suggestion would use
 
 Suggestion actions:
 
-- `Draft`: prefills a question into `Explain & Ask`
-- `Ask`: prefills and immediately sends that question
-- `Ignore`: suppresses browser notifications for that exact ready suggestion fingerprint
-- `Open`: opens the relevant Kraken market
+- `Draft`: pre-fills a question into `Explain & Ask`
+- `Ask`: pre-fills and immediately sends that question
+- `Ignore`: suppresses notifications for that specific ready suggestion
+- `Open`: opens the matching Kraken market
 
-READY notifications:
+Clicking a row opens a Kraken-style copy form modal.
 
-- when a suggestion reaches `READY`, the browser can notify you after permission is granted
-- notifications are sent once per suggestion fingerprint so the same ready setup does not spam repeatedly
-- `Ignore` stores that suppression locally and also attempts to persist it into `data/ignored-ready-suggestions.md`
-- if the app is running on a read-only filesystem, browser local storage still keeps the suppression for that browser
-
-Clicking a suggestion row opens a Kraken-style modal copy form.
-
-Supported suggestion templates:
+Supported modal templates:
 
 - `Limit`
 - `Take Profit`
@@ -149,143 +118,179 @@ Supported suggestion templates:
 - `Trailing Stop`
 - `Trailing Stop Limit`
 
-The modal provides:
+The modal is meant to make manual entry easier. It includes:
 
-- Kraken-like order layout
+- Kraken-like layout
+- direct link to the relevant Kraken market
 - field-by-field copy buttons
-- TP/SL yes/no state
-- trailing mode when relevant
-- direct `Open Kraken` link
+- TP/SL state
+- trailing mode where relevant
 
-## Explain & Ask
+### Explain & Ask
 
-`Explain & Ask` is the AI panel.
-
-Rules:
-
-- it is advisory only
-- it does not place orders
-- it does not cancel orders
-- it does not replace deterministic suggestion logic
+This is the AI support panel.
 
 It can:
 
-- answer freeform questions grounded in the current snapshot
+- answer freeform questions about the current state
+- explain a suggestion in plain language
 - show the exact snapshot payload sent to the AI route
-- receive prefilled context directly from a suggestion row
 
-## Sentiment
+It cannot:
 
-`Sentiment` is a compact deterministic market context panel.
+- place orders
+- cancel orders
+- replace the deterministic logic used by the suggestion system
+
+If `OPENAI_API_KEY` is not set, the app still works and falls back to a deterministic server-built response.
+
+### Sentiment
+
+The `Sentiment` panel is a compact market context view.
 
 It shows:
 
-- sentiment label
-- score in `%`
-- score in `bps`
+- current label (`Risk-off`, `Neutral`, `Risk-on`)
+- score in percent
+- score in basis points
 - basket size
 - reference source
-- risk thresholds
+- active thresholds
 
-## Account
+### Account
 
-`Account` is a sidebar panel containing:
+The `Account` panel contains:
 
 - `Open Orders`
 - `Latest Activity`
 
-Both inner tables are independently collapsible.
+Both tables are collapsible.
 
-`Refresh Kraken` forces a fresh authenticated account read and bypasses the in-memory account cache for the next fetch.
+`Refresh Kraken` forces a fresh authenticated Kraken read and bypasses the cached account response for that request.
 
-## Advanced Strategy
+### Advanced Strategy
 
-`Advanced Strategy` is collapsed by default.
+This panel is collapsed by default.
 
-It contains:
+It contains the settings that influence deterministic suggestions, such as:
 
 - take profit
 - stop loss
 - hold time
-- MA settings
+- moving-average settings
 - spread guardrails
-- fee/slippage assumptions
+- fee and slippage assumptions
 - net-edge thresholds
 
 It also includes `Reset to safe defaults`.
 
-## Glossary
+### Glossary
 
-The `Glossary` tab explains the terms used by the Assistant in plain language.
+The `Glossary` tab explains the assistant in plain language.
 
-It includes:
+It covers:
 
 - spread
 - mid
-- fee
+- fees
 - slippage
 - net edge
 - MA(50)
 - deviation vs MA
 - signal
 - viability
-- TP
-- SL
+- TP / SL
 - time stop
 - notional
 - quantity
-- bps
+- basis points
 
-It also explains the Kraken-style order types used in the suggestion modal:
-
-- limit order
-- stop loss order
-- take profit order
-- take profit limit order
-- iceberg order
-- trailing stop order
-- trailing stop limit order
+It also explains the Kraken-style order types used by the copy form.
 
 ## Kraken integration
 
-Kraken is read-only in this phase.
+Kraken is read-only in the current phase.
 
 Used for:
 
 - balances
 - open orders
-- latest account activity
-- public ticker data
-- public OHLC candle data
+- latest activity
+- ticker data
+- OHLC candle data
 - instrument metadata
 
 Not used for:
 
-- live order placement
+- order placement
 - cancel workflows
-- automation
+- unattended automation
+
+## Notifications and ignored suggestions
+
+When a suggestion becomes `READY`, the app can notify you in the browser after permission is granted.
+
+Important behavior:
+
+- notifications are only for `READY` suggestions
+- the same ready suggestion is not repeatedly spammed
+- `Ignore` suppresses that specific ready suggestion
+
+Ignored suggestions are persisted in two ways:
+
+- primary local store: `data/ignored-ready-suggestions.md`
+- browser fallback: `localStorage`
+
+This matters for deployment:
+
+- on a normal writable local server, ignored suggestions can be written to the markdown file
+- on read-only or ephemeral environments such as Vercel serverless storage, browser storage still keeps the suppression for that browser session/profile
+
+## Password protection
+
+The whole app is password protected.
+
+Protection applies to:
+
+- the page itself
+- the Assistant UI
+- the API routes used by the page
+
+Current behavior:
+
+- password comes from `APP_PASSWORD`
+- successful login sets a long-lived HTTP-only cookie
+- the session remains valid until the cookie is cleared or the password changes
+- page access redirects to `/login` when unauthenticated
+- protected API calls return `401` when unauthenticated
+
+This is a shared app password, not a multi-user account system.
 
 ## Caching
 
-The app uses in-memory caches for read-heavy Kraken data.
+The app uses in-memory caching for read-heavy Kraken data.
 
-Current important behavior:
+Current practical behavior:
 
 - authenticated account data is cached for about `60 seconds`
-- market lookups also use in-memory caching where appropriate
+- market reads also use in-memory caching where appropriate
 - `Refresh Kraken` bypasses the account cache for the next read
 
-Important for Vercel:
+Important caveat for Vercel:
 
-- these caches are instance-local and ephemeral
-- they work on Vercel, but cache hit behavior is not guaranteed across serverless instances
+- caches are instance-local
+- they are not durable across deployments or serverless instances
+
+That is acceptable for the current read-only assistant workflow.
 
 ## Environment variables
 
-Configure `.env.local` for local development:
+Create `.env.local` for local development.
+
+Minimum useful setup:
 
 ```bash
-APP_PASSWORD=
+APP_PASSWORD=your-password
 
 KRAKEN_API_KEY=
 KRAKEN_API_SECRET=
@@ -300,9 +305,10 @@ BOT_TIMEZONE=Europe/Amsterdam
 
 Notes:
 
-- `APP_PASSWORD` is required for access
-- Kraken keys are optional for public market data, but required for balances/open orders/latest activity
-- OpenAI is optional; without it, the AI route falls back to deterministic server-built responses
+- `APP_PASSWORD` is required
+- Kraken keys are optional if you only want public market data
+- Kraken keys are required for balances, open orders, and latest activity
+- OpenAI is optional
 
 ## Local development
 
@@ -312,7 +318,7 @@ Install dependencies:
 npm install
 ```
 
-Run the app:
+Start the app:
 
 ```bash
 npm run dev
@@ -322,47 +328,46 @@ Then open:
 
 - [http://localhost:3000](http://localhost:3000)
 
-You will be redirected to `/login` until `APP_PASSWORD` is set and entered correctly.
+If `APP_PASSWORD` is set correctly, the app will show the login page first.
 
 ## Deploying on Vercel
 
-Yes, the current manual-assistant app can be deployed on Vercel.
+This app can be deployed on Vercel in its current manual-assistant form.
 
-Recommended setup:
+Recommended environment variables:
 
-1. Import the repository into Vercel.
-2. Set the required environment variables:
-   - `APP_PASSWORD`
-   - `KRAKEN_API_KEY`
-   - `KRAKEN_API_SECRET`
-   - `OPENAI_API_KEY` if AI responses should use OpenAI
-   - optional Kraken/OpenAI overrides
-3. Deploy normally as a Next.js project.
+- `APP_PASSWORD`
+- `KRAKEN_API_KEY`
+- `KRAKEN_API_SECRET`
+- `OPENAI_API_KEY` if you want AI responses from OpenAI
+- optional Kraken/OpenAI overrides
 
-Important caveat:
+Important deployment notes:
 
-- the current assistant works on Vercel
-- the auth flow is enforced server-side as well as in middleware so Vercel edge/runtime differences do not bypass the password gate
-- long-running automation, background runners, or durable in-memory queues should not be hosted on Vercel serverless functions
+- the password gate is enforced both in middleware and server-side route/page checks
+- the current read-only assistant workflow works on Vercel
+- markdown persistence for ignored suggestions is not durable on Vercel serverless storage
+- browser `localStorage` still preserves ignored suggestions for that browser
+- long-running automation or background bot runners are not a good fit for Vercel serverless hosting
 
-That limitation matters for the legacy automation layer, not for the current read-only assistant workflow.
+## Legacy and inactive parts of the repository
+
+This repository still contains older exchange/bot-oriented code and some legacy environment parsing.
+
+That code is not the active product surface right now.
+
+In particular:
+
+- Google Sheets is not part of the current user workflow
+- the automation area is intentionally a placeholder
+- `/api/bot/*` endpoints return `410 Gone`
 
 ## Verification
 
-Run tests:
-
-```bash
-npm test
-```
-
-Run lint:
+Useful checks:
 
 ```bash
 npm run lint
-```
-
-Create a production build:
-
-```bash
+npm test
 npm run build
 ```
